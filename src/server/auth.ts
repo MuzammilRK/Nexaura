@@ -17,6 +17,7 @@ interface StoredUser {
   role: UserRole;
   defaultTenantId: string;
   defaultRegion: RegionCode;
+  countryCode?: string;
 }
 
 function hashPassword(password: string, salt: string): string {
@@ -36,7 +37,8 @@ const DEMO_USERS: StoredUser[] = (() => {
     pw: string,
     role: UserRole,
     defaultTenantId: string,
-    defaultRegion: RegionCode
+    defaultRegion: RegionCode,
+    countryCode?: string
   ): StoredUser => {
     const salt = crypto.randomBytes(16).toString('hex');
     return {
@@ -46,11 +48,16 @@ const DEMO_USERS: StoredUser[] = (() => {
       role,
       defaultTenantId,
       defaultRegion,
+      countryCode,
     };
   };
   return [
-    mk('operator', 'NexauraDevice!24', 'device_operator', 'tenant-in-bank-01', 'IN'),
-    mk('tenant.admin', 'NexauraTenant!24', 'tenant_admin', 'tenant-in-bank-01', 'IN'),
+    mk('operator', 'NexauraDevice!24', 'device_operator', 'tenant-in-bank-01', 'IN', 'IN'),
+    mk('tenant.admin', 'NexauraTenant!24', 'tenant_admin', 'tenant-in-bank-01', 'IN', 'IN'),
+    mk('admin.in', 'NexauraAdminIN!24', 'country_admin', 'all', 'IN', 'IN'),
+    mk('admin.de', 'NexauraAdminDE!24', 'country_admin', 'all', 'EU', 'DE'),
+    mk('admin.gb', 'NexauraAdminGB!24', 'country_admin', 'all', 'EU', 'GB'),
+    mk('admin.us', 'NexauraAdminUS!24', 'country_admin', 'all', 'US', 'US'),
     mk('super.admin', 'NexauraSuper!24', 'super_admin', 'all', 'IN'),
     mk('secops.peer', 'NexauraPeer!24', 'super_admin', 'all', 'IN'),
   ];
@@ -61,6 +68,7 @@ interface FailedAttemptTracker {
   lockedUntilMs: number;
 }
 
+const MAX_LOGIN_ATTEMPTS = 3;
 const failedAttempts = new Map<string, FailedAttemptTracker>();
 
 export function authenticateUser(params: {
@@ -83,97 +91,98 @@ export function authenticateUser(params: {
 
   if (tracker && tracker.lockedUntilMs > now) {
     const waitSec = Math.ceil((tracker.lockedUntilMs - now) / 1000);
-    engine.recordStructuredLog({
-      category: 'authentication',
+    engine.recordFailedLoginAlert({
+      username: key,
       tier: logTier,
       region: logRegion,
       tenantId: logTenant,
       deviceUid: matchedDevice?.uid,
-      pseudoSourceId: matchedDevice?.pseudoSourceId,
-      actor: key,
-      action: 'AUTH_LOCKOUT_BLOCKED',
-      severity: 'critical',
-      summary: `Locked login rejected for "${key}" (${waitSec}s remaining).`,
+      attemptCount: tracker.count,
+      locked: true,
+      reason: `Locked login rejected (${waitSec}s remaining).`,
     });
     return {
       status: 429,
-      error: `Account temporarily locked after repeated failures. Retry in ${waitSec}s.`,
+      error: `Account temporarily locked after ${MAX_LOGIN_ATTEMPTS} failed attempts. Retry in ${waitSec}s.`,
     };
   }
 
   const user = DEMO_USERS.find((u) => u.username === key);
   if (!user || !verifyPassword(params.password, user.salt, user.passwordHash)) {
     const nextCount = (tracker?.count ?? 0) + 1;
+    const isLockedNow = nextCount >= MAX_LOGIN_ATTEMPTS;
     failedAttempts.set(key, {
-      count: nextCount,
-      lockedUntilMs: nextCount >= 5 ? now + 30_000 : 0,
+      count: isLockedNow ? 0 : nextCount,
+      lockedUntilMs: isLockedNow ? now + 30_000 : 0,
     });
-    engine.recordStructuredLog({
-      category: 'authentication',
+    engine.recordFailedLoginAlert({
+      username: key,
       tier: logTier,
       region: logRegion,
       tenantId: logTenant,
       deviceUid: matchedDevice?.uid,
-      pseudoSourceId: matchedDevice?.pseudoSourceId,
-      actor: key,
-      action: nextCount >= 5 ? 'AUTH_ACCOUNT_LOCKED' : 'AUTH_INVALID_CREDENTIALS',
-      severity: nextCount >= 5 ? 'critical' : 'high',
-      summary:
-        nextCount >= 5
-          ? `Account "${key}" locked for 30s after 5 invalid credential attempts.`
-          : `Failed authentication attempt #${nextCount} for "${key}".`,
+      attemptCount: nextCount,
+      locked: isLockedNow,
+      reason: isLockedNow
+        ? `Account "${key}" locked for 30s after ${MAX_LOGIN_ATTEMPTS} failed sign-in attempts.`
+        : `Failed sign-in attempt #${nextCount} of ${MAX_LOGIN_ATTEMPTS} for "${key}".`,
     });
     return {
       status: 401,
-      error:
-        nextCount >= 5
-          ? 'Too many failed attempts. Account locked for 30s.'
-          : `Invalid credentials (${5 - nextCount} attempts remaining before lockout).`,
+      error: isLockedNow
+        ? `Too many failed attempts (${MAX_LOGIN_ATTEMPTS}/${MAX_LOGIN_ATTEMPTS}). Account locked for 30s and alert dispatched to server.`
+        : `Invalid credentials (${MAX_LOGIN_ATTEMPTS - nextCount} attempt${MAX_LOGIN_ATTEMPTS - nextCount === 1 ? '' : 's'} remaining before lockout).`,
     };
   }
 
   if (params.requiredRole === 'super_admin' && user.role !== 'super_admin') {
-    engine.recordStructuredLog({
-      category: 'authentication',
+    engine.recordFailedLoginAlert({
+      username: user.username,
       tier: 'tier2',
       region: logRegion,
       tenantId: logTenant,
-      actor: user.username,
-      action: 'AUTH_ROLE_DENIED',
-      severity: 'high',
-      summary: `Denied Super Admin login attempt by role "${user.role}".`,
+      attemptCount: 1,
+      locked: false,
+      reason: `Denied Super Admin login attempt by role "${user.role}".`,
     });
     return {
       status: 403,
-      error: 'Fresh Super Admin role credentials are required to access Tier 2 Regional SaaS.',
+      error: 'Fresh Super Admin role credentials are required to access Tier 2.',
     };
   }
 
   if (params.requiredRole === 'any_admin' && user.role === 'device_operator') {
-    engine.recordStructuredLog({
-      category: 'authentication',
+    engine.recordFailedLoginAlert({
+      username: user.username,
       tier: 'tier2',
       region: logRegion,
       tenantId: logTenant,
-      actor: user.username,
-      action: 'AUTH_ELEVATION_BLOCKED',
-      severity: 'high',
-      summary: `Blocked device_operator "${user.username}" from elevating directly to Tier 2 SaaS.`,
+      attemptCount: 1,
+      locked: false,
+      reason: `Blocked device_operator "${user.username}" from elevating directly to Tier 2.`,
     });
     return {
       status: 403,
-      error: 'Device operator credentials cannot elevate directly to Regional SaaS.',
+      error: 'Device operator credentials cannot elevate directly to Tier 2.',
     };
   }
 
   failedAttempts.delete(key);
 
   const expiresAtMs = now + 2 * 60 * 60 * 1000;
+  const resolvedRegion: RegionCode =
+    user.role === 'super_admin' ? params.region ?? user.defaultRegion : user.defaultRegion;
+  const resolvedTenant =
+    user.role === 'super_admin' || user.role === 'country_admin'
+      ? params.tenantId ?? 'all'
+      : params.tenantId ?? user.defaultTenantId;
+
   const payload: Omit<SessionInfo, 'token'> = {
     username: user.username,
     role: user.role,
-    tenantId: user.role === 'super_admin' ? params.tenantId ?? 'all' : params.tenantId ?? user.defaultTenantId,
-    region: params.region ?? user.defaultRegion,
+    tenantId: resolvedTenant,
+    region: resolvedRegion,
+    countryCode: user.countryCode,
     deviceUid: params.deviceUid,
     expiresAtUtc: new Date(expiresAtMs).toISOString(),
   };

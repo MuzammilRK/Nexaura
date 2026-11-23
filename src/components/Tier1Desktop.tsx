@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   Activity,
@@ -15,18 +15,24 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   Download,
+  Globe,
 } from 'lucide-react';
 import { useNexauraStore, type DesktopAppId } from '../state/useNexauraStore';
-import { CollectorConsole, type ReconcileSummary } from './CollectorConsole';
+import { CollectorConsole, type InfraCatalogOption, type ReconcileSummary } from './CollectorConsole';
 import { StructuredLogsPanel } from './StructuredLogsPanel';
+import { TelemetryHealthVisuals } from './TelemetryHealthVisuals';
 import { PanelErrorBoundary } from './PanelErrorBoundary';
+import { MultiPortPanel } from './MultiPortPanel';
+import { WebsiteRunnerApp } from './WebsiteRunnerApp';
 import type {
   DeviceProfile,
   EgressProofRecord,
   EncryptedFileTransfer,
   HealthEvaluation,
+  HostTelemetrySample,
   LiveDeviceMetrics,
   SpoolEntry,
+  TenantCommPolicy,
   WindowsLogEntry,
 } from '../shared/schema';
 import { GLOBAL_TOPOLOGY } from '../shared/topology';
@@ -36,6 +42,8 @@ interface CollectorDeviceResponse {
   device: DeviceProfile;
   metrics: LiveDeviceMetrics;
   health: HealthEvaluation;
+  hostTelemetry?: HostTelemetrySample;
+  metricHistory: { cpu: number[]; latency: number[]; memory: number[] };
   rawLogs: WindowsLogEntry[];
   egressLog: EgressProofRecord[];
   spool: SpoolEntry[];
@@ -45,11 +53,32 @@ interface CollectorDeviceResponse {
   lastHeartbeatUtc: string;
   reconcile: ReconcileSummary;
   transfers: EncryptedFileTransfer[];
+  tenantCommPolicy: TenantCommPolicy;
+  assignedAdmin?: {
+    username: string;
+    displayName: string;
+    superAdminId: string;
+    countryName: string;
+    crossCountryGranted: boolean;
+  };
+  routerCatalog?: InfraCatalogOption[];
+  storageCatalog?: InfraCatalogOption[];
+  lockedPeerCounts: {
+    outsideDistrict: number;
+    outsideCity: number;
+    outsideCountry: number;
+    totalHidden: number;
+  };
   peerDevices: {
     uid: string;
     hostname: string;
     tenantId: string;
     cityName: string;
+    districtName: string;
+    countryName: string;
+    cityCode: string;
+    districtCode: string;
+    countryCode: string;
     industry: string;
   }[];
 }
@@ -87,15 +116,31 @@ export function Tier1Desktop() {
       if (!r.ok) throw new Error('Failed to load Tier 1 device state');
       return r.json();
     },
-    refetchInterval: 4000,
+    refetchInterval: 15000,
+    refetchOnWindowFocus: false,
   });
 
   // Terminal state
   const [termCmd, setTermCmd] = useState('');
+  const [termCmdHistory, setTermCmdHistory] = useState<string[]>([]);
+  const [termHistIdx, setTermHistIdx] = useState<number>(-1);
   const [termHistory, setTermHistory] = useState<string[]>([
     `Nexaura WinShell [${shortDeviceUid(targetUid)}]`,
-    'Type "help", "uid", "status", or "whoami".',
+    'Type "help", "uid", "status", "router", "storage", "cloud", or "admin".',
   ]);
+  const termInputRef = useRef<HTMLInputElement | null>(null);
+  const termEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (activeDesktopApp === 'terminal') {
+      const id = window.setTimeout(() => termInputRef.current?.focus(), 40);
+      return () => window.clearTimeout(id);
+    }
+  }, [activeDesktopApp]);
+
+  useEffect(() => {
+    termEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [termHistory.length]);
 
   // CipherShare Mesh state
   const [peerUid, setPeerUid] = useState('');
@@ -141,21 +186,72 @@ export function Tier1Desktop() {
 
   const handleTerminalSubmit = (e: FormEvent) => {
     e.preventDefault();
-    const cmd = termCmd.trim();
-    if (!cmd) return;
-    let out = `Unknown command: ${cmd}`;
-    if (cmd === 'help') out = 'Commands: uid | whoami | status | topology | clear';
-    else if (cmd === 'uid') out = `Local UID: ${targetUid} (SaaS Pseudonym: ${device?.pseudoSourceId})`;
-    else if (cmd === 'whoami') out = `${device?.username ?? deviceSession.username}@${device?.hostname ?? 'host'} [${deviceSession.role}]`;
-    else if (cmd === 'status') out = `Health: ${data?.health.state} (${data?.health.overallScore}/100) · Queue: ${data?.spoolDepth ?? 0}`;
-    else if (cmd === 'topology') out = `${shortDeviceUid(targetUid)} -> ${device?.floorSwitchId} -> ${device?.buildingCoreId} -> ${device?.collectorId}`;
-    else if (cmd === 'clear') {
+    const raw = termCmd.trim();
+    if (!raw) return;
+    const cmd = raw.toLowerCase();
+    setTermCmdHistory((prev) => [raw, ...prev.slice(0, 29)]);
+    setTermHistIdx(-1);
+
+    let out = `Unknown command: "${raw}". Type "help" for valid commands.`;
+    if (cmd === 'help') {
+      out = 'Commands: help | uid | whoami | status | topology | router | storage | cloud | admin | clear';
+    } else if (cmd === 'uid') {
+      out = `Local UID: ${targetUid} (SaaS Pseudonym: ${device?.pseudoSourceId ?? 'pending'})`;
+    } else if (cmd === 'whoami') {
+      out = `${device?.username ?? deviceSession.username}@${device?.hostname ?? 'host'} [${deviceSession.role}]`;
+    } else if (cmd === 'status') {
+      out = `Health: ${data?.health.state ?? 'Good'} (${data?.health.overallScore ?? '--'}/100) · CPU: ${data?.metrics.cpuPct ?? '--'}% · Queue: ${data?.spoolDepth ?? 0}`;
+    } else if (cmd === 'topology') {
+      out = `${shortDeviceUid(targetUid)} -> ${device?.floorSwitchId} -> ${device?.buildingCoreId} -> ${device?.collectorId}`;
+    } else if (cmd === 'router') {
+      const r = data?.metrics.router;
+      out = r
+        ? `Edge Router ${r.routerId} [${r.status}] · Data: ${r.dataTransferredMb.toFixed(1)} MB · Pkts: ${r.packetCount} · Sent: ${r.packetsSent} · Loss: ${r.packetLossCount} (${r.packetLossPct}%)${r.activeError ? ` · Error: ${r.activeError}` : ''}`
+        : 'Router telemetry initializing...';
+    } else if (cmd === 'storage') {
+      const s = data?.metrics.storage;
+      out = s
+        ? `Storage ${s.storageId} [${s.status}] · Used: ${s.usedPct}% of ${s.capacityGb} GB · IOPS: ${s.iops} · RAID: ${s.raidState} · SMART: ${s.smartStatus}${s.activeError ? ` · Error: ${s.activeError}` : ''}`
+        : 'Storage telemetry initializing...';
+    } else if (cmd === 'cloud') {
+      const c = data?.metrics.cloud;
+      out = c
+        ? `Cloud Uplink ${c.cloudId} [${c.status}] · Region: ${c.regionEndpoint} · mTLS: ${c.mtlsState} · Latency: ${c.syncLatencyMs}ms`
+        : 'Cloud uplink telemetry initializing...';
+    } else if (cmd === 'admin') {
+      const adm = data?.assignedAdmin;
+      out = adm
+        ? `Country: ${adm.countryName} · Connected Admin: ${adm.username} · Country Super Admin: ${adm.superAdminId} · Cross-Country Grant: ${adm.crossCountryGranted ? 'Granted' : 'Locked'}`
+        : 'Authority record unavailable.';
+    } else if (cmd === 'clear') {
       setTermHistory([]);
       setTermCmd('');
       return;
     }
-    setTermHistory((prev) => [...prev, `PS C:\\Nexaura> ${cmd}`, out]);
+
+    setTermHistory((prev) => [...prev, `PS C:\\Nexaura> ${raw}`, out]);
     setTermCmd('');
+    termInputRef.current?.focus();
+  };
+
+  const handleTerminalKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (termCmdHistory.length === 0) return;
+      const nextIdx = Math.min(termCmdHistory.length - 1, termHistIdx + 1);
+      setTermHistIdx(nextIdx);
+      setTermCmd(termCmdHistory[nextIdx]);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (termHistIdx <= 0) {
+        setTermHistIdx(-1);
+        setTermCmd('');
+      } else {
+        const nextIdx = termHistIdx - 1;
+        setTermHistIdx(nextIdx);
+        setTermCmd(termCmdHistory[nextIdx]);
+      }
+    }
   };
 
   const handleCipherSend = async (e: FormEvent) => {
@@ -178,6 +274,11 @@ export function Tier1Desktop() {
       }),
     });
     const body = await res.json();
+    if (!res.ok) {
+      setMeshMsg(body.error || 'Transfer blocked by external communication policy.');
+      refetch();
+      return;
+    }
     if (body.transfer) {
       setMeshMsg(
         body.transfer.status === 'blocked_policy'
@@ -219,6 +320,7 @@ export function Tier1Desktop() {
 
   const desktopApps: { id: DesktopAppId; label: string; icon: typeof Shield }[] = [
     { id: 'collector', label: 'Nexaura Collector', icon: Shield },
+    { id: 'browser', label: 'Web Browser & Host', icon: Globe },
     { id: 'logs', label: 'Logs & Audit', icon: ScrollText },
     { id: 'taskmgr', label: 'Task Manager', icon: Activity },
     { id: 'eventvwr', label: 'Event Viewer', icon: FileText },
@@ -244,6 +346,7 @@ export function Tier1Desktop() {
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
+          <MultiPortPanel authToken={deviceSession.token} hostTelemetry={data?.hostTelemetry} />
           <button
             type="button"
             onClick={() => setScreen('world')}
@@ -335,6 +438,7 @@ export function Tier1Desktop() {
                       device={data.device}
                       metrics={data.metrics}
                       health={data.health}
+                      metricHistory={data.metricHistory}
                       rawLogs={data.rawLogs}
                       egressLog={data.egressLog}
                       spool={data.spool}
@@ -342,8 +446,19 @@ export function Tier1Desktop() {
                       outageActive={data.outageActive}
                       lastHeartbeatUtc={data.lastHeartbeatUtc}
                       reconcile={data.reconcile}
+                      assignedAdmin={data.assignedAdmin}
+                      routerCatalog={data.routerCatalog}
+                      storageCatalog={data.storageCatalog}
                       token={deviceSession.token}
                       onRefresh={() => refetch()}
+                    />
+                  )}
+
+                  {activeDesktopApp === 'browser' && (
+                    <WebsiteRunnerApp
+                      deviceUid={data.device.uid}
+                      token={deviceSession.token}
+                      onTrafficRecorded={() => refetch()}
                     />
                   )}
 
@@ -354,11 +469,29 @@ export function Tier1Desktop() {
                       region={data.device.region}
                       tenantIds={[data.device.tenantId]}
                       deviceUid={data.device.uid}
+                      defaultActor={deviceSession.username}
                     />
                   )}
 
                   {activeDesktopApp === 'taskmgr' && (
                     <div className="p-5 space-y-5">
+                      <TelemetryHealthVisuals
+                        title={`System Telemetry & Heart Beat Monitor (${data.device.hostname})`}
+                        subtitle={`${data.device.cpuSpec} · ${data.device.ramGb} GB RAM`}
+                        score={data.health.overallScore}
+                        state={data.health.state}
+                        subScores={data.health.subScores}
+                        cpuPct={data.metrics.cpuPct}
+                        memoryPct={data.metrics.memoryPct}
+                        latencyMs={data.metrics.latencyMs}
+                        diskPct={data.metrics.diskPct}
+                        packetLossPct={data.metrics.packetLossPct}
+                        failedLogins={data.metrics.failedLogins}
+                        isStale={data.health.isStale}
+                        cpuHistory={data.metricHistory?.cpu}
+                        latencyHistory={data.metricHistory?.latency}
+                      />
+
                       <div className="grid gap-3 sm:grid-cols-4 font-mono tabular-nums">
                         <div className="rounded-lg border border-[#222733] bg-[#12151C] p-3.5">
                           <div className="text-xs text-zinc-400">CPU Utilization</div>
@@ -379,6 +512,60 @@ export function Tier1Desktop() {
                           </div>
                         </div>
                       </div>
+
+                      {/* Subsystem Hardware Readouts */}
+                      {(data.metrics.router || data.metrics.storage || data.metrics.cloud) && (
+                        <div className="grid gap-3 sm:grid-cols-3 text-xs font-mono tabular-nums">
+                          {data.metrics.router && (
+                            <div className="rounded-lg border border-[#222733] bg-[#12151C] p-3.5">
+                              <div className="flex items-center justify-between text-zinc-400">
+                                <span>Edge Router ({data.metrics.router.routerId})</span>
+                                <span className={data.metrics.router.status === 'Nominal' ? 'text-emerald-400' : 'text-amber-400'}>
+                                  {data.metrics.router.status}
+                                </span>
+                              </div>
+                              <div className="mt-1.5 text-zinc-200">
+                                {data.metrics.router.dataTransferredMb.toFixed(1)} MB · {data.metrics.router.packetsSent}/{data.metrics.router.packetCount} pkts
+                              </div>
+                              <div className="mt-0.5 text-[11px] text-zinc-400">
+                                Loss: {data.metrics.router.packetLossCount} ({data.metrics.router.packetLossPct}%)
+                              </div>
+                            </div>
+                          )}
+                          {data.metrics.storage && (
+                            <div className="rounded-lg border border-[#222733] bg-[#12151C] p-3.5">
+                              <div className="flex items-center justify-between text-zinc-400">
+                                <span>Local Storage ({data.metrics.storage.storageId})</span>
+                                <span className={data.metrics.storage.status === 'Nominal' ? 'text-emerald-400' : 'text-amber-400'}>
+                                  {data.metrics.storage.status}
+                                </span>
+                              </div>
+                              <div className="mt-1.5 text-zinc-200">
+                                {data.metrics.storage.usedPct}% of {data.metrics.storage.capacityGb} GB · {data.metrics.storage.iops} IOPS
+                              </div>
+                              <div className="mt-0.5 text-[11px] text-zinc-400">
+                                {data.metrics.storage.raidState} · SMART {data.metrics.storage.smartStatus}
+                              </div>
+                            </div>
+                          )}
+                          {data.metrics.cloud && (
+                            <div className="rounded-lg border border-[#222733] bg-[#12151C] p-3.5">
+                              <div className="flex items-center justify-between text-zinc-400">
+                                <span>Cloud Uplink ({data.metrics.cloud.regionEndpoint})</span>
+                                <span className={data.metrics.cloud.status === 'Nominal' ? 'text-emerald-400' : 'text-amber-400'}>
+                                  {data.metrics.cloud.status}
+                                </span>
+                              </div>
+                              <div className="mt-1.5 text-zinc-200">
+                                mTLS: {data.metrics.cloud.mtlsState} · {data.metrics.cloud.syncLatencyMs} ms
+                              </div>
+                              <div className="mt-0.5 text-[11px] text-zinc-400">
+                                {data.metrics.cloud.provider}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <div className="rounded-lg border border-[#222733] bg-[#12151C] p-4">
                         <h2 className="text-xs font-semibold text-white">Running Processes ({data.device.hostname})</h2>
                         <table className="mt-3 w-full text-left text-xs">
@@ -468,21 +655,38 @@ export function Tier1Desktop() {
                   )}
 
                   {activeDesktopApp === 'terminal' && (
-                    <div className="flex h-full flex-col bg-[#090B0E] p-4 font-mono text-xs text-emerald-400">
-                      <div className="flex-1 space-y-1 overflow-y-auto">
+                    <div
+                      onClick={() => termInputRef.current?.focus()}
+                      className="flex min-h-[420px] h-full cursor-text flex-col bg-[#090B0E] p-4 font-mono text-xs text-emerald-400"
+                    >
+                      <div className="flex-1 space-y-1.5 overflow-y-auto pr-2">
                         {termHistory.map((line, i) => (
-                          <div key={i} className="whitespace-pre-wrap">{line}</div>
+                          <div key={i} className="whitespace-pre-wrap leading-relaxed">{line}</div>
                         ))}
+                        <div ref={termEndRef} />
                       </div>
-                      <form onSubmit={handleTerminalSubmit} className="mt-3 flex items-center gap-2 border-t border-[#222733] pt-2">
-                        <span className="text-blue-400">PS&gt;</span>
+                      <form
+                        onSubmit={handleTerminalSubmit}
+                        className="mt-3 flex items-center gap-2 rounded-md border border-[#222733] bg-[#0F131A] px-3 py-2"
+                      >
+                        <span className="font-semibold text-blue-400 select-none">PS&gt;</span>
                         <input
+                          ref={termInputRef}
+                          autoFocus
                           type="text"
                           value={termCmd}
                           onChange={(e) => setTermCmd(e.target.value)}
-                          placeholder="Enter command (help, uid, status, topology)"
-                          className="flex-1 bg-transparent text-white focus:outline-none"
+                          onKeyDown={handleTerminalKeyDown}
+                          aria-label="Nexaura WinShell command prompt"
+                          placeholder="Type command (help, status, router, storage, cloud, admin, clear)..."
+                          className="flex-1 bg-transparent text-white placeholder:text-zinc-500 focus:outline-none"
                         />
+                        <button
+                          type="submit"
+                          className="rounded border border-[#2B3242] bg-[#1A1E28] px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                        >
+                          Run
+                        </button>
                       </form>
                     </div>
                   )}
@@ -509,10 +713,65 @@ export function Tier1Desktop() {
                           </button>
                         </div>
 
+                        {/* Cross-Boundary Reachability Policy Status */}
+                        <div className="mt-3 rounded-md border border-[#222733] bg-[#0B0D11] p-3 text-xs">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-medium text-zinc-200">
+                              External Reachability Policy ({data.device.cityName} · {data.device.districtName})
+                            </span>
+                            <span className="font-mono text-[11px] text-zinc-400">
+                              {data.peerDevices.length} visible · {data.lockedPeerCounts?.totalHidden ?? 0} locked by policy
+                            </span>
+                          </div>
+                          {data.assignedAdmin && (
+                            <div className="mt-1.5 flex flex-wrap items-center gap-3 font-mono text-[11px] text-zinc-400">
+                              <span>Country Admin: <span className="text-zinc-200">{data.assignedAdmin.username}</span></span>
+                              <span>Country Super Admin: <span className="text-zinc-200">{data.assignedAdmin.superAdminId}</span></span>
+                              <span className={data.assignedAdmin.crossCountryGranted ? 'text-emerald-400' : 'text-amber-400'}>
+                                Admin Cross-Country Grant: {data.assignedAdmin.crossCountryGranted ? 'Approved' : 'Awaiting Super Admin'}
+                              </span>
+                            </div>
+                          )}
+                          <div className="mt-2 flex flex-wrap gap-2 font-mono text-[11px]">
+                            <span
+                              className={`rounded border px-2 py-0.5 ${
+                                data.tenantCommPolicy?.allowOutsideDistrict
+                                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                  : 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                              }`}
+                            >
+                              Outside District: {data.tenantCommPolicy?.allowOutsideDistrict ? 'UNLOCKED' : 'LOCKED'}
+                            </span>
+                            <span
+                              className={`rounded border px-2 py-0.5 ${
+                                data.tenantCommPolicy?.allowOutsideCity
+                                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                  : 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                              }`}
+                            >
+                              Outside City: {data.tenantCommPolicy?.allowOutsideCity ? 'UNLOCKED' : 'LOCKED'}
+                            </span>
+                            <span
+                              className={`rounded border px-2 py-0.5 ${
+                                data.tenantCommPolicy?.allowOutsideCountry
+                                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                  : 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                              }`}
+                            >
+                              Outside Country: {data.tenantCommPolicy?.allowOutsideCountry ? 'UNLOCKED' : 'LOCKED'}
+                            </span>
+                          </div>
+                          {(data.lockedPeerCounts?.totalHidden ?? 0) > 0 && (
+                            <p className="mt-1.5 text-[11px] text-zinc-400">
+                              Hidden external peers ({data.lockedPeerCounts.outsideDistrict} other districts, {data.lockedPeerCounts.outsideCity} other cities, {data.lockedPeerCounts.outsideCountry} other countries). Cross-country transfer requires two-step approval: Super Admin grants permission to Country Admin, who then unlocks this device.
+                            </p>
+                          )}
+                        </div>
+
                         <form onSubmit={handleCipherSend} className="mt-4 grid gap-3 sm:grid-cols-3">
                           <div>
                             <label htmlFor="peer-select" className="block text-[11px] text-zinc-300">
-                              Recipient Device
+                              Permitted Recipient Device ({data.peerDevices.length})
                             </label>
                             <select
                               id="peer-select"
@@ -522,7 +781,7 @@ export function Tier1Desktop() {
                             >
                               {data.peerDevices.map((p) => (
                                 <option key={p.uid} value={p.uid}>
-                                  {shortDeviceUid(p.uid)} ({p.cityName})
+                                  {shortDeviceUid(p.uid)} · {p.cityName} ({p.districtCode}/{p.countryCode})
                                 </option>
                               ))}
                             </select>

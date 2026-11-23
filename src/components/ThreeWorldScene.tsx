@@ -2,15 +2,30 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import type { DeviceProfile, HealthState, LiveDeviceMetrics } from '../shared/schema';
+import type {
+  CloudSystemTelemetry,
+  DeviceProfile,
+  HealthState,
+  InfraStatus,
+  LiveDeviceMetrics,
+  RegionCode,
+  RouterTelemetry,
+  StorageTelemetry,
+} from '../shared/schema';
 import type { WorldFocus } from '../state/useNexauraStore';
 
 export interface WorldDeviceNode extends DeviceProfile {
   metrics: LiveDeviceMetrics | null;
 }
 
+export type ServerInfraMap = Record<
+  RegionCode,
+  { router: RouterTelemetry; storage: StorageTelemetry; cloud: CloudSystemTelemetry }
+>;
+
 interface ThreeWorldSceneProps {
   devices: WorldDeviceNode[];
+  serverInfra?: ServerInfraMap;
   focus: WorldFocus;
   reducedEffects: boolean;
   onSelectFocus: (next: Partial<WorldFocus>) => void;
@@ -23,6 +38,13 @@ const HEALTH_HEX: Record<HealthState, number> = {
   Fair: 0xf59e0b,
   Poor: 0xef4444,
 };
+
+function infraStatusToHex(status?: InfraStatus): number {
+  if (status === 'Offline') return 0x64748b;
+  if (status === 'Critical') return 0xef4444;
+  if (status === 'Warning') return 0xf59e0b;
+  return 0x10b981;
+}
 
 function latLonToVec3(lat: number, lon: number, radius: number, out: THREE.Vector3): THREE.Vector3 {
   const phi = (90 - lat) * (Math.PI / 180);
@@ -132,6 +154,7 @@ function createRaisedFloorTexture(): THREE.CanvasTexture {
 
 export function ThreeWorldScene({
   devices,
+  serverInfra,
   focus,
   reducedEffects,
   onSelectFocus,
@@ -140,14 +163,18 @@ export function ThreeWorldScene({
   const mountRef = useRef<HTMLDivElement | null>(null);
   const focusRef = useRef(focus);
   const devicesRef = useRef(devices);
+  const serverInfraRef = useRef(serverInfra);
   const onSelectRef = useRef(onSelectFocus);
+  const onWebglUnavailableRef = useRef(onWebglUnavailable);
   const reducedRef = useRef(reducedEffects);
   const rebuildSceneRef = useRef<((animateZoom?: boolean) => void) | null>(null);
-  const prevFocusKeyRef = useRef<string>('');
+  const prevSceneKeyRef = useRef<string>('');
 
   focusRef.current = focus;
   devicesRef.current = devices;
+  serverInfraRef.current = serverInfra;
   onSelectRef.current = onSelectFocus;
+  onWebglUnavailableRef.current = onWebglUnavailable;
   reducedRef.current = reducedEffects;
 
   useEffect(() => {
@@ -177,7 +204,7 @@ export function ThreeWorldScene({
         powerPreference: 'high-performance',
       });
     } catch {
-      onWebglUnavailable();
+      onWebglUnavailableRef.current();
       return;
     }
 
@@ -202,7 +229,7 @@ export function ThreeWorldScene({
       pmrem.dispose();
     }
 
-    const camera = new THREE.PerspectiveCamera(44, width / height, 0.1, 200);
+    const camera = new THREE.PerspectiveCamera(44, width / height, 0.25, 150);
     latLonToVec3(22, 42, 14.6, camera.position);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -224,8 +251,14 @@ export function ThreeWorldScene({
     const dynamicRoot = new THREE.Group();
     scene.add(dynamicRoot);
 
-    const auraRings: { mesh: THREE.Mesh; speed: number; baseScale: number }[] = [];
     const clickables: THREE.Object3D[] = [];
+    const healthSyncEntries: {
+      deviceUids: string[];
+      update: (state: HealthState, selectedUid: string | null) => void;
+    }[] = [];
+    const infraSyncEntries: {
+      update: (allDevices: WorldDeviceNode[], srv?: ServerInfraMap) => void;
+    }[] = [];
 
     let zoomAnimating = false;
     const desiredCamPos = camera.position.clone();
@@ -389,6 +422,37 @@ export function ThreeWorldScene({
 
     const buildingMaterials: (THREE.MeshStandardMaterial | THREE.MeshPhysicalMaterial)[] = [];
 
+    let pbrLoadedCount = 0;
+    const applyPbrMapsToMaterials = () => {
+      for (const mat of buildingMaterials) {
+        if (pbrTex.baseColor) {
+          mat.map = pbrTex.baseColor;
+          mat.color.setHex(0xffffff);
+        }
+        if (pbrTex.emissive) {
+          mat.emissiveMap = pbrTex.emissive;
+          mat.emissive.setHex(0xffffff);
+          mat.emissiveIntensity = 1.05;
+        }
+        if (pbrTex.normal) {
+          mat.normalMap = pbrTex.normal;
+          mat.normalScale.set(0.75, 0.75);
+        }
+        if (pbrTex.metallicRoughness) {
+          mat.roughnessMap = pbrTex.metallicRoughness;
+          mat.metalnessMap = pbrTex.metallicRoughness;
+        }
+        if (pbrTex.clearcoat && mat instanceof THREE.MeshPhysicalMaterial) {
+          mat.clearcoatMap = pbrTex.clearcoat;
+          mat.clearcoat = 0.65;
+        }
+        mat.needsUpdate = true;
+      }
+      if (isSoftwareGl || focusRef.current.level === 'city' || focusRef.current.level === 'district') {
+        requestRender();
+      }
+    };
+
     const loadPbrMap = (
       url: string,
       key: keyof typeof pbrTex,
@@ -410,33 +474,20 @@ export function ThreeWorldScene({
         tex.wrapS = THREE.RepeatWrapping;
         tex.wrapT = THREE.RepeatWrapping;
         tex.repeat.set(1, 2);
+        tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
         tex.needsUpdate = true;
         pbrTex[key] = tex;
         disposableTextures.push(tex);
 
-        // Bind loaded texture onto active building facade materials
-        for (const mat of buildingMaterials) {
-          if (key === 'baseColor') {
-            mat.map = tex;
-            mat.color.setHex(0xffffff);
-          } else if (key === 'emissive') {
-            mat.emissiveMap = tex;
-            mat.emissive.setHex(0xffffff);
-            mat.emissiveIntensity = 1.05;
-          } else if (key === 'normal') {
-            mat.normalMap = tex;
-            mat.normalScale.set(0.75, 0.75);
-          } else if (key === 'metallicRoughness') {
-            mat.roughnessMap = tex;
-            mat.metalnessMap = tex;
-          } else if (key === 'clearcoat' && mat instanceof THREE.MeshPhysicalMaterial) {
-            mat.clearcoatMap = tex;
-            mat.clearcoat = 0.65;
-          }
-          mat.needsUpdate = true;
+        pbrLoadedCount += 1;
+        if (pbrLoadedCount === 5) {
+          applyPbrMapsToMaterials();
         }
-        if (isSoftwareGl || focusRef.current.level === 'city' || focusRef.current.level === 'district') {
-          requestRender();
+      };
+      img.onerror = () => {
+        pbrLoadedCount += 1;
+        if (pbrLoadedCount === 5 && !disposed) {
+          applyPbrMapsToMaterials();
         }
       };
       img.src = url;
@@ -478,9 +529,10 @@ export function ThreeWorldScene({
     const _mid = new THREE.Vector3();
 
     function clearDynamicRoot() {
-      auraRings.length = 0;
       clickables.length = 0;
       buildingMaterials.length = 0;
+      healthSyncEntries.length = 0;
+      infraSyncEntries.length = 0;
       while (dynamicRoot.children.length > 0) {
         const child = dynamicRoot.children[0];
         dynamicRoot.remove(child);
@@ -554,14 +606,17 @@ export function ThreeWorldScene({
       globeGroup.add(globeMesh);
       clickables.push(globeMesh);
 
-      const atmoGeo = new THREE.SphereGeometry(5.1, 36, 24);
+      const atmoGeo = new THREE.SphereGeometry(5.12, 36, 24);
       const atmoMat = new THREE.MeshBasicMaterial({
         color: 0x3b82f6,
         transparent: true,
         opacity: 0.08,
+        depthWrite: false,
         side: THREE.BackSide,
       });
-      globeGroup.add(new THREE.Mesh(atmoGeo, atmoMat));
+      const atmoMesh = new THREE.Mesh(atmoGeo, atmoMat);
+      atmoMesh.renderOrder = 2;
+      globeGroup.add(atmoMesh);
 
       dynamicRoot.add(globeGroup);
 
@@ -602,30 +657,42 @@ export function ThreeWorldScene({
         baseMesh.rotation.x = Math.PI / 2;
         beacon.add(baseMesh);
 
+        const spireMat = new THREE.MeshStandardMaterial({
+          color: colorHex,
+          emissive: colorHex,
+          emissiveIntensity: 0.7,
+          roughness: 0.25,
+          metalness: 0.3,
+        });
         const spireMesh = new THREE.Mesh(
           new THREE.CylinderGeometry(0.045, 0.075, 0.48, 12),
-          new THREE.MeshStandardMaterial({
-            color: colorHex,
-            emissive: colorHex,
-            emissiveIntensity: 0.7,
-            roughness: 0.25,
-            metalness: 0.3,
-          })
+          spireMat
         );
         spireMesh.rotation.x = Math.PI / 2;
         spireMesh.position.z = 0.24;
         beacon.add(spireMesh);
 
+        const auraMat = new THREE.MeshBasicMaterial({
+          color: colorHex,
+          transparent: true,
+          opacity: 0.72,
+          depthWrite: false,
+        });
         const auraMesh = new THREE.Mesh(
           new THREE.TorusGeometry(0.24, 0.02, 8, 28),
-          new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.72 })
+          auraMat
         );
-        auraMesh.position.z = 0.07;
+        auraMesh.position.z = 0.08;
+        auraMesh.renderOrder = 2;
         beacon.add(auraMesh);
-        auraRings.push({
-          mesh: auraMesh,
-          speed: 1.4 + Math.min(3.5, avgLatency / 50),
-          baseScale: 1,
+        healthSyncEntries.push({
+          deviceUids: list.map((d) => d.uid),
+          update: (nextState) => {
+            const hex = HEALTH_HEX[nextState];
+            spireMat.color.setHex(hex);
+            spireMat.emissive.setHex(hex);
+            auraMat.color.setHex(hex);
+          },
         });
 
         const hit = new THREE.Mesh(
@@ -662,8 +729,11 @@ export function ThreeWorldScene({
           color: 0x60a5fa,
           transparent: true,
           opacity: 0.42,
+          depthWrite: false,
         });
-        dynamicRoot.add(new THREE.Mesh(tubeGeo, tubeMat));
+        const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+        tubeMesh.renderOrder = 2;
+        dynamicRoot.add(tubeMesh);
       }
 
       if (animateZoom) {
@@ -704,40 +774,153 @@ export function ThreeWorldScene({
         plazaBase.position.y = -0.12;
         dynamicRoot.add(plazaBase);
 
-        // Avenue boulevard & central fiber spine trench
+        // Avenue boulevards, cross streets, granite curbs, crosswalks & streetlamps
         const avenueMat = new THREE.MeshStandardMaterial({
-          color: 0x0f141e,
-          roughness: 0.9,
+          color: 0x0c111a,
+          roughness: 0.88,
           metalness: 0.08,
           polygonOffset: true,
           polygonOffsetFactor: -1,
         });
-        const frontAve = new THREE.Mesh(new THREE.PlaneGeometry(42, 2.2), avenueMat);
-        frontAve.rotation.x = -Math.PI / 2;
-        frontAve.position.set(0, 0.01, 3.3);
-        dynamicRoot.add(frontAve);
-
-        const backAve = new THREE.Mesh(new THREE.PlaneGeometry(42, 2.2), avenueMat);
-        backAve.rotation.x = -Math.PI / 2;
-        backAve.position.set(0, 0.01, -3.5);
-        dynamicRoot.add(backAve);
-
-        // Dashed road lane markers
-        const stripeMat = new THREE.MeshBasicMaterial({
-          color: 0x475569,
+        const curbMat = new THREE.MeshStandardMaterial({
+          color: 0x283244,
+          roughness: 0.72,
+          metalness: 0.2,
+        });
+        const edgeLineMat = new THREE.MeshBasicMaterial({
+          color: 0x334155,
           polygonOffset: true,
           polygonOffsetFactor: -2,
         });
-        for (let sx = -18; sx <= 18; sx += 2.4) {
+        const stripeMat = new THREE.MeshBasicMaterial({
+          color: 0x64748b,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+        });
+        const crosswalkMat = new THREE.MeshBasicMaterial({
+          color: 0x94a3b8,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+        });
+
+        // Primary East-West front & back avenues (staggered >=0.02 on Y to prevent Z-fighting)
+        const frontAve = new THREE.Mesh(new THREE.PlaneGeometry(42, 2.3), avenueMat);
+        frontAve.rotation.x = -Math.PI / 2;
+        frontAve.position.set(0, 0.032, 3.3);
+        dynamicRoot.add(frontAve);
+
+        const backAve = new THREE.Mesh(new THREE.PlaneGeometry(42, 2.3), avenueMat);
+        backAve.rotation.x = -Math.PI / 2;
+        backAve.position.set(0, 0.032, -3.5);
+        dynamicRoot.add(backAve);
+
+        // North-South cross streets in open corridors (x = +-8.6) & outer perimeter roads (x = +-19.2)
+        for (const rx of [-8.6, 8.6]) {
+          const nsRoad = new THREE.Mesh(new THREE.PlaneGeometry(2.1, 10.6), avenueMat);
+          nsRoad.rotation.x = -Math.PI / 2;
+          nsRoad.position.set(rx, 0.018, -0.1);
+          dynamicRoot.add(nsRoad);
+
+          for (let sz = -4.8; sz <= 4.6; sz += 1.6) {
+            if (Math.abs(sz - 3.3) < 1.2 || Math.abs(sz + 3.5) < 1.2) continue;
+            const nsDash = new THREE.Mesh(new THREE.PlaneGeometry(0.08, 0.8), stripeMat);
+            nsDash.rotation.x = -Math.PI / 2;
+            nsDash.position.set(rx, 0.05, sz);
+            dynamicRoot.add(nsDash);
+          }
+
+          // Intersection zebra crosswalks on both East-West avenues
+          for (const az of [3.3, -3.5]) {
+            for (const offset of [-1.35, 1.35]) {
+              for (let cz = -0.8; cz <= 0.8; cz += 0.32) {
+                const cw = new THREE.Mesh(new THREE.PlaneGeometry(0.45, 0.14), crosswalkMat);
+                cw.rotation.x = -Math.PI / 2;
+                cw.position.set(rx + offset, 0.056, az + cz);
+                dynamicRoot.add(cw);
+              }
+            }
+          }
+        }
+
+        for (const outerX of [-19.2, 19.2]) {
+          const outerRoad = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 24), avenueMat);
+          outerRoad.rotation.x = -Math.PI / 2;
+          outerRoad.position.set(outerX, 0.018, 0);
+          dynamicRoot.add(outerRoad);
+          for (let sz = -10.5; sz <= 10.5; sz += 2.2) {
+            const dash = new THREE.Mesh(new THREE.PlaneGeometry(0.08, 1.0), stripeMat);
+            dash.rotation.x = -Math.PI / 2;
+            dash.position.set(outerX, 0.05, sz);
+            dynamicRoot.add(dash);
+          }
+        }
+
+        // Granite sidewalk curbs & edge lines along avenues
+        for (const az of [3.3, -3.5]) {
+          for (const side of [-1.24, 1.24]) {
+            const curb = new THREE.Mesh(new THREE.BoxGeometry(42, 0.07, 0.18), curbMat);
+            curb.position.set(0, 0.035, az + side);
+            dynamicRoot.add(curb);
+
+            const edgeLine = new THREE.Mesh(new THREE.PlaneGeometry(41.8, 0.05), edgeLineMat);
+            edgeLine.rotation.x = -Math.PI / 2;
+            edgeLine.position.set(0, 0.048, az + side * 0.88);
+            dynamicRoot.add(edgeLine);
+          }
+        }
+
+        // Dashed center lane markers
+        for (let sx = -17.5; sx <= 17.5; sx += 2.3) {
+          if (Math.abs(sx - 8.6) < 1.5 || Math.abs(sx + 8.6) < 1.5) continue;
           const dashF = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.08), stripeMat);
           dashF.rotation.x = -Math.PI / 2;
-          dashF.position.set(sx, 0.02, 3.3);
+          dashF.position.set(sx, 0.052, 3.3);
           dynamicRoot.add(dashF);
 
           const dashB = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.08), stripeMat);
           dashB.rotation.x = -Math.PI / 2;
-          dashB.position.set(sx, 0.02, -3.5);
+          dashB.position.set(sx, 0.052, -3.5);
           dynamicRoot.add(dashB);
+        }
+
+        // Architectural streetlights along avenue curbs
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.4, metalness: 0.8 });
+        const lampHeadMat = new THREE.MeshStandardMaterial({
+          color: 0xe0f2fe,
+          emissive: 0xbae6fd,
+          emissiveIntensity: 0.9,
+          roughness: 0.2,
+        });
+        for (const lx of [-11.5, -5.5, 0, 5.5, 11.5]) {
+          for (const [lz, dir] of [[2.02, 1], [-2.22, -1]] as [number, number][]) {
+            const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.05, 1.35, 8), poleMat);
+            pole.position.set(lx, 0.68, lz);
+            dynamicRoot.add(pole);
+
+            const arm = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.42), poleMat);
+            arm.position.set(lx, 1.33, lz + dir * 0.18);
+            dynamicRoot.add(arm);
+
+            const head = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.04, 0.2), lampHeadMat);
+            head.position.set(lx, 1.3, lz + dir * 0.36);
+            dynamicRoot.add(head);
+          }
+        }
+
+        // Urban median planter trees in open plaza pockets
+        const planterMat = new THREE.MeshStandardMaterial({ color: 0x2b3648, roughness: 0.75, metalness: 0.2 });
+        const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4a3525, roughness: 0.9 });
+        const foliageMat = new THREE.MeshStandardMaterial({ color: 0x1e4d3b, roughness: 0.8 });
+        for (const [tx, tz] of [[-14.2, 4.9], [-3.2, 4.9], [3.2, 4.9], [14.2, 4.9], [-14.2, -5.1], [14.2, -5.1]]) {
+          const planter = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.16, 0.9), planterMat);
+          planter.position.set(tx, 0.08, tz);
+          dynamicRoot.add(planter);
+          const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.07, 0.45, 7), trunkMat);
+          trunk.position.set(tx, 0.36, tz);
+          dynamicRoot.add(trunk);
+          const crown = new THREE.Mesh(new THREE.DodecahedronGeometry(0.36, 0), foliageMat);
+          crown.position.set(tx, 0.76, tz);
+          dynamicRoot.add(crown);
         }
 
         // Connected Monitored Nexaura Buildings along main tech boulevard
@@ -802,35 +985,45 @@ export function ThreeWorldScene({
 
           // Connected Nexaura telemetry beacon mast
           const roofBeaconY = 0.46 + bHeight + 0.72;
+          const roofColMat = new THREE.MeshStandardMaterial({
+            color: colorHex,
+            emissive: colorHex,
+            emissiveIntensity: 0.8,
+            roughness: 0.25,
+            metalness: 0.4,
+          });
           const roofCol = new THREE.Mesh(
             new THREE.CylinderGeometry(0.11, 0.18, 0.46, 12),
-            new THREE.MeshStandardMaterial({
-              color: colorHex,
-              emissive: colorHex,
-              emissiveIntensity: 0.8,
-              roughness: 0.25,
-              metalness: 0.4,
-            })
+            roofColMat
           );
           roofCol.position.y = roofBeaconY;
           bGroup.add(roofCol);
           connectedTopAnchorPts.push(new THREE.Vector3(x, roofBeaconY + 0.18, 0));
 
-          // Ground health ring
+          // Ground health ring cleanly encircling plinth without intersecting it
+          const haloMat = new THREE.MeshBasicMaterial({
+            color: colorHex,
+            transparent: true,
+            opacity: 0.82,
+            depthWrite: false,
+          });
           const halo = new THREE.Mesh(
-            new THREE.TorusGeometry(1.62, 0.04, 8, 36),
-            new THREE.MeshBasicMaterial({
-              color: colorHex,
-              transparent: true,
-              opacity: 0.85,
-              polygonOffset: true,
-              polygonOffsetFactor: -1,
-            })
+            new THREE.TorusGeometry(2.08, 0.04, 8, 40),
+            haloMat
           );
           halo.rotation.x = Math.PI / 2;
-          halo.position.y = 0.06;
+          halo.position.y = 0.08;
+          halo.renderOrder = 2;
           bGroup.add(halo);
-          auraRings.push({ mesh: halo, speed: 1.4 + avgLatency / 45, baseScale: 1 });
+          healthSyncEntries.push({
+            deviceUids: list.map((d) => d.uid),
+            update: (nextState) => {
+              const hex = HEALTH_HEX[nextState];
+              roofColMat.color.setHex(hex);
+              roofColMat.emissive.setHex(hex);
+              haloMat.color.setHex(hex);
+            },
+          });
 
           const hit = new THREE.Mesh(
             new THREE.BoxGeometry(2.9, bHeight + 1.4, 2.7),
@@ -860,8 +1053,14 @@ export function ThreeWorldScene({
           const curve = new THREE.QuadraticBezierCurve3(pA, mid, pB);
           const fiberMesh = new THREE.Mesh(
             new THREE.TubeGeometry(curve, 18, 0.032, 6, false),
-            new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.78 })
+            new THREE.MeshBasicMaterial({
+              color: 0x38bdf8,
+              transparent: true,
+              opacity: 0.78,
+              depthWrite: false,
+            })
           );
+          fiberMesh.renderOrder = 2;
           dynamicRoot.add(fiberMesh);
         }
 
@@ -996,11 +1195,13 @@ export function ThreeWorldScene({
               color: 0x38bdf8,
               transparent: true,
               opacity: 0.22,
+              depthWrite: false,
               roughness: 0.15,
               metalness: 0.2,
             })
           );
-          glassRail.position.set(0, 0.33, 2.1);
+          glassRail.position.set(0, 0.35, 2.1);
+          glassRail.renderOrder = 4;
           fGroup.add(glassRail);
 
           // IDF Floor Switch Rack + status strip
@@ -1008,31 +1209,47 @@ export function ThreeWorldScene({
             new THREE.BoxGeometry(0.9, 1.05, 0.65),
             new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.38, metalness: 0.78 })
           );
-          idfCabinet.position.set(0, 0.64, -1.25);
+          idfCabinet.position.set(0, 0.66, -1.25);
           fGroup.add(idfCabinet);
 
+          const swLedMat = new THREE.MeshStandardMaterial({
+            color: colorHex,
+            emissive: colorHex,
+            emissiveIntensity: 0.85,
+            roughness: 0.2,
+            metalness: 0.4,
+          });
           const swLedBar = new THREE.Mesh(
             new THREE.BoxGeometry(0.72, 0.12, 0.06),
-            new THREE.MeshStandardMaterial({
-              color: colorHex,
-              emissive: colorHex,
-              emissiveIntensity: 0.85,
-              roughness: 0.2,
-              metalness: 0.4,
-            })
+            swLedMat
           );
-          swLedBar.position.set(0, 0.92, -0.91);
+          swLedBar.position.set(0, 0.94, -0.9);
           fGroup.add(swLedBar);
 
-          // Floor health ring around IDF switch
+          // Floor health ring around IDF switch (offset clear of slab top y=0.12)
+          const floorAuraMat = new THREE.MeshBasicMaterial({
+            color: colorHex,
+            transparent: true,
+            opacity: 0.78,
+            depthWrite: false,
+          });
           const aura = new THREE.Mesh(
             new THREE.TorusGeometry(0.85, 0.03, 8, 32),
-            new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.78 })
+            floorAuraMat
           );
           aura.rotation.x = Math.PI / 2;
-          aura.position.set(0, 0.15, -1.25);
+          aura.position.set(0, 0.17, -1.25);
+          aura.renderOrder = 2;
           fGroup.add(aura);
-          auraRings.push({ mesh: aura, speed: 1.4 + avgLatency / 45, baseScale: 1 });
+          healthSyncEntries.push({
+            deviceUids: floorDevs.map((d) => d.uid),
+            update: (nextState) => {
+              const hex = HEALTH_HEX[nextState];
+              swLedMat.color.setHex(hex);
+              swLedMat.emissive.setHex(hex);
+              floorAuraMat.color.setHex(hex);
+            },
+          });
 
           // Sample desk cluster indicator per floor
           const clusterCount = Math.min(3, Math.max(1, floorDevs.length));
@@ -1095,7 +1312,7 @@ export function ThreeWorldScene({
       raisedSlab.position.y = -0.12;
       dynamicRoot.add(raisedSlab);
 
-      // Recessed cable-tray strip connecting server rack bay to workstation row
+      // Recessed cable-tray strip connecting server rack bay to workstation row (offset >=0.02 above y=0)
       const cableTrench = new THREE.Mesh(
         new THREE.PlaneGeometry(roomWidth - 1.6, 0.65),
         new THREE.MeshStandardMaterial({
@@ -1103,11 +1320,11 @@ export function ThreeWorldScene({
           roughness: 0.7,
           metalness: 0.3,
           polygonOffset: true,
-          polygonOffsetFactor: -1,
+          polygonOffsetFactor: -2,
         })
       );
       cableTrench.rotation.x = -Math.PI / 2;
-      cableTrench.position.set(0, 0.01, -0.35);
+      cableTrench.position.set(0, 0.024, -0.35);
       dynamicRoot.add(cableTrench);
 
       // Back acoustic glass / brushed slate server bay wall + architectural cornice trim
@@ -1177,7 +1394,7 @@ export function ThreeWorldScene({
         hubGroup.add(ledStrip);
       }
 
-      // Top Fiber Waterfall Duct & Status Beacon
+      // Top Fiber Waterfall Duct & Server Overhead Status Beacon
       const topHood = new THREE.Mesh(
         new THREE.BoxGeometry(1.42, 0.16, 1.06),
         new THREE.MeshStandardMaterial({ color: 0x253042, roughness: 0.4, metalness: 0.75 })
@@ -1185,7 +1402,147 @@ export function ThreeWorldScene({
       topHood.position.y = 2.36;
       hubGroup.add(topHood);
 
+      const { state: hubState } = worstHealth(scoped);
+      const hubBeaconMat = new THREE.MeshStandardMaterial({
+        color: HEALTH_HEX[hubState],
+        emissive: HEALTH_HEX[hubState],
+        emissiveIntensity: 1.05,
+        roughness: 0.2,
+      });
+      const hubMast = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.26, 8), sideTrimMat);
+      hubMast.position.set(0, 2.55, 0);
+      hubGroup.add(hubMast);
+      const hubBeacon = new THREE.Mesh(new THREE.SphereGeometry(0.11, 14, 14), hubBeaconMat);
+      hubBeacon.position.set(0, 2.72, 0);
+      hubGroup.add(hubBeacon);
+
+      healthSyncEntries.push({
+        deviceUids: scoped.map((d) => d.uid),
+        update: (nextState) => {
+          const hex = HEALTH_HEX[nextState];
+          hubBeaconMat.color.setHex(hex);
+          hubBeaconMat.emissive.setHex(hex);
+        },
+      });
+
       dynamicRoot.add(hubGroup);
+
+      // Regional Server Infrastructure Pods beside 42U Server Cabinet (Router, Storage Array & Cloud Gateway)
+      const siteRegion: RegionCode = scoped[0]?.region ?? 'IN';
+      const initialSrv = serverInfraRef.current?.[siteRegion];
+
+      // 1. Server Core Router Unit (-1.75, 0, -2.9)
+      const srvRouterGroup = new THREE.Group();
+      srvRouterGroup.position.set(-1.75, 0, -2.9);
+      const srvRouterChassis = new THREE.Mesh(
+        new THREE.BoxGeometry(0.92, 0.72, 0.84),
+        new THREE.MeshStandardMaterial({ color: 0x182130, roughness: 0.38, metalness: 0.72 })
+      );
+      srvRouterChassis.position.y = 0.36;
+      srvRouterGroup.add(srvRouterChassis);
+      for (const ax of [-0.32, 0.32]) {
+        const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.022, 0.45, 8), sideTrimMat);
+        ant.position.set(ax, 0.94, -0.25);
+        srvRouterGroup.add(ant);
+      }
+      const srvRouterLedMat = new THREE.MeshStandardMaterial({
+        color: infraStatusToHex(initialSrv?.router.status),
+        emissive: infraStatusToHex(initialSrv?.router.status),
+        emissiveIntensity: 1.15,
+        roughness: 0.18,
+      });
+      const srvRouterMast = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.38, 8), sideTrimMat);
+      srvRouterMast.position.set(0, 0.91, 0.12);
+      srvRouterGroup.add(srvRouterMast);
+      const srvRouterLight = new THREE.Mesh(new THREE.SphereGeometry(0.115, 14, 14), srvRouterLedMat);
+      srvRouterLight.position.set(0, 1.14, 0.12);
+      srvRouterGroup.add(srvRouterLight);
+      const srvRouterRing = new THREE.Mesh(
+        new THREE.BoxGeometry(0.74, 0.07, 0.04),
+        srvRouterLedMat
+      );
+      srvRouterRing.position.set(0, 0.56, 0.43);
+      srvRouterGroup.add(srvRouterRing);
+      dynamicRoot.add(srvRouterGroup);
+
+      // 2. Server Storage Array (+1.75, 0, -2.9)
+      const srvStorageGroup = new THREE.Group();
+      srvStorageGroup.position.set(1.75, 0, -2.9);
+      const srvStorageChassis = new THREE.Mesh(
+        new THREE.BoxGeometry(1.02, 0.96, 0.9),
+        new THREE.MeshStandardMaterial({ color: 0x141b26, roughness: 0.42, metalness: 0.68 })
+      );
+      srvStorageChassis.position.y = 0.48;
+      srvStorageGroup.add(srvStorageChassis);
+      for (let bay = 0; bay < 3; bay++) {
+        const slot = new THREE.Mesh(
+          new THREE.BoxGeometry(0.84, 0.18, 0.04),
+          new THREE.MeshStandardMaterial({ color: 0x263246, roughness: 0.35, metalness: 0.7 })
+        );
+        slot.position.set(0, 0.24 + bay * 0.25, 0.46);
+        srvStorageGroup.add(slot);
+      }
+      const srvStorageLedMat = new THREE.MeshStandardMaterial({
+        color: infraStatusToHex(initialSrv?.storage.status),
+        emissive: infraStatusToHex(initialSrv?.storage.status),
+        emissiveIntensity: 1.15,
+        roughness: 0.18,
+      });
+      const srvStorageMast = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.36, 8), sideTrimMat);
+      srvStorageMast.position.set(0, 1.14, 0.12);
+      srvStorageGroup.add(srvStorageMast);
+      const srvStorageLight = new THREE.Mesh(new THREE.SphereGeometry(0.115, 14, 14), srvStorageLedMat);
+      srvStorageLight.position.set(0, 1.36, 0.12);
+      srvStorageGroup.add(srvStorageLight);
+      dynamicRoot.add(srvStorageGroup);
+
+      // 3. Server Cloud Gateway Unit (+2.95, 0, -2.9)
+      const srvCloudGroup = new THREE.Group();
+      srvCloudGroup.position.set(2.95, 0, -2.9);
+      const srvCloudBase = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.42, 0.48, 0.85, 16),
+        new THREE.MeshStandardMaterial({ color: 0x1b263b, roughness: 0.35, metalness: 0.72 })
+      );
+      srvCloudBase.position.y = 0.425;
+      srvCloudGroup.add(srvCloudBase);
+      const srvCloudDish = new THREE.Mesh(
+        new THREE.TorusGeometry(0.28, 0.045, 10, 24),
+        new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.3, metalness: 0.82 })
+      );
+      srvCloudDish.rotation.x = Math.PI / 2;
+      srvCloudDish.position.y = 0.92;
+      srvCloudGroup.add(srvCloudDish);
+      const srvCloudLedMat = new THREE.MeshStandardMaterial({
+        color: infraStatusToHex(initialSrv?.cloud.status),
+        emissive: infraStatusToHex(initialSrv?.cloud.status),
+        emissiveIntensity: 1.15,
+        roughness: 0.18,
+      });
+      const srvCloudMast = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.32, 8), sideTrimMat);
+      srvCloudMast.position.set(0, 1.06, 0);
+      srvCloudGroup.add(srvCloudMast);
+      const srvCloudLight = new THREE.Mesh(new THREE.SphereGeometry(0.115, 14, 14), srvCloudLedMat);
+      srvCloudLight.position.set(0, 1.28, 0);
+      srvCloudGroup.add(srvCloudLight);
+      dynamicRoot.add(srvCloudGroup);
+
+      infraSyncEntries.push({
+        update: (_all, srv) => {
+          const cur = srv?.[siteRegion];
+          if (!cur) return;
+          const rHex = infraStatusToHex(cur.router.status);
+          srvRouterLedMat.color.setHex(rHex);
+          srvRouterLedMat.emissive.setHex(rHex);
+
+          const sHex = infraStatusToHex(cur.storage.status);
+          srvStorageLedMat.color.setHex(sHex);
+          srvStorageLedMat.emissive.setHex(sHex);
+
+          const cHex = infraStatusToHex(cur.cloud.status);
+          srvCloudLedMat.color.setHex(cHex);
+          srvCloudLedMat.emissive.setHex(cHex);
+        },
+      });
 
       // Grounded Multi-Part Client Workstations
       const spacing = 3.2;
@@ -1202,12 +1559,12 @@ export function ThreeWorldScene({
         const ws = new THREE.Group();
         ws.position.copy(devPos);
 
-        // Floor rubber mat beneath desk (y=0.01)
+        // Floor rubber mat beneath desk (y=0.015 -> top 0.03)
         const floorMat = new THREE.Mesh(
-          new THREE.BoxGeometry(2.15, 0.02, 1.65),
+          new THREE.BoxGeometry(2.15, 0.03, 1.65),
           new THREE.MeshStandardMaterial({ color: 0x151b26, roughness: 0.9, metalness: 0.05 })
         );
-        floorMat.position.y = 0.01;
+        floorMat.position.y = 0.015;
         ws.add(floorMat);
 
         // 4 Tubular Steel Desk Legs grounded cleanly on floor mat (y=0.02 -> y=0.74)
@@ -1236,11 +1593,12 @@ export function ThreeWorldScene({
         tower.position.set(0.72, 1.07, -0.08);
         ws.add(tower);
 
+        const towerLedMat = new THREE.MeshStandardMaterial({ color: colorHex, emissive: colorHex, emissiveIntensity: 0.9 });
         const towerLed = new THREE.Mesh(
-          new THREE.BoxGeometry(0.16, 0.035, 0.02),
-          new THREE.MeshStandardMaterial({ color: colorHex, emissive: colorHex, emissiveIntensity: 0.9 })
+          new THREE.BoxGeometry(0.16, 0.035, 0.025),
+          towerLedMat
         );
-        towerLed.position.set(0.72, 1.24, 0.185);
+        towerLed.position.set(0.72, 1.24, 0.195);
         ws.add(towerLed);
 
         // Brushed Aluminum Monitor Stand + Curved Ultrawide Display
@@ -1265,32 +1623,35 @@ export function ThreeWorldScene({
         screenHousing.position.set(-0.22, 1.18, -0.16);
         ws.add(screenHousing);
 
+        const screenFaceMat = new THREE.MeshStandardMaterial({
+          color: dev.accentHex,
+          emissive: dev.accentHex,
+          emissiveIntensity: isSelected ? 1.0 : 0.45,
+          roughness: 0.18,
+          metalness: 0.1,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+        });
         const screenFace = new THREE.Mesh(
           new THREE.PlaneGeometry(1.1, 0.54),
-          new THREE.MeshStandardMaterial({
-            color: dev.accentHex,
-            emissive: dev.accentHex,
-            emissiveIntensity: isSelected ? 1.0 : 0.45,
-            roughness: 0.18,
-            metalness: 0.1,
-          })
+          screenFaceMat
         );
-        screenFace.position.set(-0.22, 1.18, -0.13);
+        screenFace.position.set(-0.22, 1.18, -0.125);
         ws.add(screenFace);
 
-        // Keyboard + Desk Pad
+        // Keyboard + Desk Pad (spaced >=0.02 above tabletop)
         const deskPad = new THREE.Mesh(
-          new THREE.BoxGeometry(0.86, 0.015, 0.36),
+          new THREE.BoxGeometry(0.86, 0.016, 0.36),
           new THREE.MeshStandardMaterial({ color: 0x0f141c, roughness: 0.85, metalness: 0.05 })
         );
-        deskPad.position.set(-0.22, 0.798, 0.22);
+        deskPad.position.set(-0.22, 0.806, 0.22);
         ws.add(deskPad);
 
         const keyboard = new THREE.Mesh(
-          new THREE.BoxGeometry(0.46, 0.02, 0.16),
+          new THREE.BoxGeometry(0.46, 0.024, 0.16),
           new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.5, metalness: 0.4 })
         );
-        keyboard.position.set(-0.28, 0.815, 0.22);
+        keyboard.position.set(-0.28, 0.832, 0.22);
         ws.add(keyboard);
 
         // Ergonomic Task Chair positioned cleanly in front of desk
@@ -1322,21 +1683,21 @@ export function ThreeWorldScene({
         chairBack.position.set(-0.2, 0.82, 0.94);
         ws.add(chairBack);
 
-        // Workstation status aura ring on floor
+        // Workstation status aura ring cleanly framing floor mat without Z-fighting
+        const wsAuraMat = new THREE.MeshBasicMaterial({
+          color: colorHex,
+          transparent: true,
+          opacity: isSelected ? 0.94 : 0.66,
+          depthWrite: false,
+        });
         const aura = new THREE.Mesh(
-          new THREE.TorusGeometry(1.18, isSelected ? 0.048 : 0.03, 8, 36),
-          new THREE.MeshBasicMaterial({
-            color: colorHex,
-            transparent: true,
-            opacity: isSelected ? 0.94 : 0.66,
-            polygonOffset: true,
-            polygonOffsetFactor: -1,
-          })
+          new THREE.TorusGeometry(1.42, isSelected ? 0.046 : 0.03, 8, 40),
+          wsAuraMat
         );
         aura.rotation.x = Math.PI / 2;
-        aura.position.y = 0.035;
+        aura.position.y = 0.065;
+        aura.renderOrder = 2;
         ws.add(aura);
-        auraRings.push({ mesh: aura, speed: 1.4 + Math.min(4.5, lat / 40), baseScale: 1 });
 
         // Overhead Fiber-Optic Conduit from Server Cabinet top to Workstation
         const linkCurve = new THREE.QuadraticBezierCurve3(
@@ -1344,11 +1705,108 @@ export function ThreeWorldScene({
           new THREE.Vector3(x * 0.55, 2.05, -0.5),
           new THREE.Vector3(x + 0.72, 1.15, 1.35)
         );
+        const linkMat = new THREE.MeshBasicMaterial({
+          color: colorHex,
+          transparent: true,
+          opacity: 0.65,
+          depthWrite: false,
+        });
         const linkMesh = new THREE.Mesh(
           new THREE.TubeGeometry(linkCurve, 18, 0.024, 6, false),
-          new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.65 })
+          linkMat
         );
+        linkMesh.renderOrder = 2;
         dynamicRoot.add(linkMesh);
+
+        // Workstation Edge Router, Local Storage NAS & Cloud Uplink Pod with overhead status lights
+        const devRouterMat = new THREE.MeshStandardMaterial({
+          color: infraStatusToHex(dev.metrics?.router?.status),
+          emissive: infraStatusToHex(dev.metrics?.router?.status),
+          emissiveIntensity: 1.15,
+          roughness: 0.2,
+        });
+        const wsRouterBox = new THREE.Mesh(
+          new THREE.BoxGeometry(0.28, 0.09, 0.22),
+          new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.4, metalness: 0.72 })
+        );
+        wsRouterBox.position.set(-0.84, 0.835, -0.28);
+        ws.add(wsRouterBox);
+        const wsRouterMast = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.22, 6), legMat);
+        wsRouterMast.position.set(-0.84, 0.99, -0.28);
+        ws.add(wsRouterMast);
+        const wsRouterLight = new THREE.Mesh(new THREE.SphereGeometry(0.058, 12, 12), devRouterMat);
+        wsRouterLight.position.set(-0.84, 1.13, -0.28);
+        ws.add(wsRouterLight);
+
+        const devStorageMat = new THREE.MeshStandardMaterial({
+          color: infraStatusToHex(dev.metrics?.storage?.status),
+          emissive: infraStatusToHex(dev.metrics?.storage?.status),
+          emissiveIntensity: 1.15,
+          roughness: 0.2,
+        });
+        const wsStorageBox = new THREE.Mesh(
+          new THREE.BoxGeometry(0.24, 0.24, 0.34),
+          new THREE.MeshStandardMaterial({ color: 0x161f2e, roughness: 0.42, metalness: 0.68 })
+        );
+        wsStorageBox.position.set(0.72, 1.47, -0.08);
+        ws.add(wsStorageBox);
+        const wsStorageMast = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.16, 6), legMat);
+        wsStorageMast.position.set(0.72, 1.66, -0.08);
+        ws.add(wsStorageMast);
+        const wsStorageLight = new THREE.Mesh(new THREE.SphereGeometry(0.058, 12, 12), devStorageMat);
+        wsStorageLight.position.set(0.72, 1.77, -0.08);
+        ws.add(wsStorageLight);
+
+        const devCloudMat = new THREE.MeshStandardMaterial({
+          color: infraStatusToHex(dev.metrics?.cloud?.status),
+          emissive: infraStatusToHex(dev.metrics?.cloud?.status),
+          emissiveIntensity: 1.15,
+          roughness: 0.2,
+        });
+        const wsCloudPod = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.11, 0.13, 0.09, 12),
+          new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.38, metalness: 0.72 })
+        );
+        wsCloudPod.position.set(0.28, 0.835, -0.34);
+        ws.add(wsCloudPod);
+        const wsCloudMast = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.2, 6), legMat);
+        wsCloudMast.position.set(0.28, 0.98, -0.34);
+        ws.add(wsCloudMast);
+        const wsCloudLight = new THREE.Mesh(new THREE.SphereGeometry(0.058, 12, 12), devCloudMat);
+        wsCloudLight.position.set(0.28, 1.11, -0.34);
+        ws.add(wsCloudLight);
+
+        infraSyncEntries.push({
+          update: (all) => {
+            const found = all.find((x) => x.uid === dev.uid);
+            if (!found?.metrics) return;
+            const rHex = infraStatusToHex(found.metrics.router?.status);
+            devRouterMat.color.setHex(rHex);
+            devRouterMat.emissive.setHex(rHex);
+
+            const sHex = infraStatusToHex(found.metrics.storage?.status);
+            devStorageMat.color.setHex(sHex);
+            devStorageMat.emissive.setHex(sHex);
+
+            const cHex = infraStatusToHex(found.metrics.cloud?.status);
+            devCloudMat.color.setHex(cHex);
+            devCloudMat.emissive.setHex(cHex);
+          },
+        });
+
+        healthSyncEntries.push({
+          deviceUids: [dev.uid],
+          update: (nextState, selectedUid) => {
+            const hex = HEALTH_HEX[nextState];
+            const active = selectedUid === dev.uid;
+            towerLedMat.color.setHex(hex);
+            towerLedMat.emissive.setHex(hex);
+            wsAuraMat.color.setHex(hex);
+            wsAuraMat.opacity = active ? 0.94 : 0.66;
+            screenFaceMat.emissiveIntensity = active ? 1.0 : 0.45;
+            linkMat.color.setHex(hex);
+          },
+        });
 
         const hit = new THREE.Mesh(
           new THREE.BoxGeometry(2.2, 1.8, 1.8),
@@ -1368,14 +1826,38 @@ export function ThreeWorldScene({
       }
     }
 
+    function syncHealthStatesInPlace(allDevices: WorldDeviceNode[], selectedUid: string | null) {
+      const byUid = new Map<string, WorldDeviceNode>();
+      for (const d of allDevices) byUid.set(d.uid, d);
+      for (const entry of healthSyncEntries) {
+        const subset = entry.deviceUids
+          .map((uid) => byUid.get(uid))
+          .filter((d): d is WorldDeviceNode => Boolean(d));
+        if (subset.length > 0) {
+          entry.update(worstHealth(subset).state, selectedUid);
+        }
+      }
+      for (const entry of infraSyncEntries) {
+        entry.update(allDevices, serverInfraRef.current);
+      }
+      if (isSoftwareGl) requestRender();
+    }
+
     function rebuildScene(animateZoom = false) {
-      clearDynamicRoot();
       const f = focusRef.current;
       const list = devicesRef.current;
-      const isInitialMount = prevFocusKeyRef.current === '';
-      const focusKey = `${f.level}:${f.countryCode ?? ''}:${f.cityCode ?? ''}:${f.districtCode ?? ''}:${f.buildingCode ?? ''}:${f.floorNumber ?? ''}:${f.deviceUid ?? ''}`;
-      const shouldZoom = animateZoom || focusKey !== prevFocusKeyRef.current;
-      prevFocusKeyRef.current = focusKey;
+      const isInitialMount = prevSceneKeyRef.current === '';
+      // Keep sceneKey scoped to structural view level (device selection updates highlight in-place without rebuilding room)
+      const sceneKey = `${f.level === 'device' ? 'floor' : f.level}:${f.countryCode ?? ''}:${f.cityCode ?? ''}:${f.districtCode ?? ''}:${f.buildingCode ?? ''}:${f.floorNumber ?? ''}`;
+
+      if (!animateZoom && !isInitialMount && sceneKey === prevSceneKeyRef.current && healthSyncEntries.length > 0) {
+        syncHealthStatesInPlace(list, f.deviceUid ?? null);
+        return;
+      }
+
+      clearDynamicRoot();
+      const shouldZoom = animateZoom || sceneKey !== prevSceneKeyRef.current;
+      prevSceneKeyRef.current = sceneKey;
 
       if (f.level === 'globe' || f.level === 'country') {
         buildGlobeAndRegionalView(f, list, shouldZoom, isInitialMount);
@@ -1430,16 +1912,8 @@ export function ThreeWorldScene({
       const nowPerf = performance.now();
       const dt = (nowPerf - lastPerfMs) / 1000;
       lastPerfMs = nowPerf;
-      const elapsed = (nowPerf - startPerfMs) / 1000;
 
       stepZoomAnimation(dt);
-
-      if (!reducedRef.current) {
-        for (const ring of auraRings) {
-          const s = ring.baseScale + Math.sin(elapsed * ring.speed) * 0.12;
-          ring.mesh.scale.set(s, s, 1);
-        }
-      }
       controls.update();
       renderer.render(scene, camera);
       updateCameraAttr();
@@ -1470,12 +1944,13 @@ export function ThreeWorldScene({
 
     const onContextLost = (ev: Event) => {
       ev.preventDefault();
-      onWebglUnavailable();
+      onWebglUnavailableRef.current();
     };
     renderer.domElement.addEventListener('webglcontextlost', onContextLost);
 
     return () => {
       disposed = true;
+      prevSceneKeyRef.current = '';
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       window.removeEventListener('resize', onResize);
@@ -1488,11 +1963,11 @@ export function ThreeWorldScene({
       for (const t of disposableTextures) t.dispose();
       renderer.dispose();
     };
-  }, [onWebglUnavailable]);
+  }, []);
 
   useEffect(() => {
     rebuildSceneRef.current?.(false);
-  }, [focus, devices]);
+  }, [focus, devices, serverInfra]);
 
   return (
     <div

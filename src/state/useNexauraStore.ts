@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { RegionCode, SessionInfo } from '../shared/schema';
+import type { ClusterPortBinding, PortRole, RegionCode, SessionInfo } from '../shared/schema';
 
 export type AppScreen = 'world' | 'device-login' | 'desktop' | 'super-login' | 'saas';
 
@@ -24,12 +24,13 @@ export interface WorldFocus {
 
 export type DesktopAppId =
   | 'collector'
+  | 'logs'
   | 'taskmgr'
   | 'eventvwr'
-  | 'logs'
   | 'explorer'
   | 'terminal'
   | 'ciphershare'
+  | 'browser'
   | 'industry';
 
 interface NexauraState {
@@ -41,6 +42,11 @@ interface NexauraState {
   saasSession: SessionInfo | null;
   activeDesktopApp: DesktopAppId;
   activeSaasRegion: RegionCode;
+  runtimePort: number;
+  portRole: PortRole;
+  activePorts: ClusterPortBinding[];
+  wsConnected: boolean;
+  wsLastRttMs: number | null;
   setScreen: (screen: AppScreen) => void;
   setWorldFocus: (focus: Partial<WorldFocus>) => void;
   resetWorldFocus: () => void;
@@ -50,6 +56,12 @@ interface NexauraState {
   setSaasSession: (s: SessionInfo | null) => void;
   setActiveDesktopApp: (app: DesktopAppId) => void;
   setActiveSaasRegion: (region: RegionCode) => void;
+  setRuntimeInfo: (info: {
+    runtimePort: number;
+    portRole: PortRole;
+    activePorts?: ClusterPortBinding[];
+  }) => void;
+  setWsState: (wsConnected: boolean, wsLastRttMs?: number | null) => void;
 }
 
 const INITIAL_FOCUS: WorldFocus = {
@@ -71,6 +83,11 @@ export const useNexauraStore = create<NexauraState>((set) => ({
   saasSession: null,
   activeDesktopApp: 'collector',
   activeSaasRegion: 'IN',
+  runtimePort: 3000,
+  portRole: 'hub',
+  activePorts: [],
+  wsConnected: false,
+  wsLastRttMs: null,
   setScreen: (screen) => set({ screen }),
   setWorldFocus: (focus) =>
     set((state) => ({ worldFocus: { ...state.worldFocus, ...focus } })),
@@ -81,4 +98,16 @@ export const useNexauraStore = create<NexauraState>((set) => ({
   setSaasSession: (saasSession) => set({ saasSession }),
   setActiveDesktopApp: (activeDesktopApp) => set({ activeDesktopApp }),
   setActiveSaasRegion: (activeSaasRegion) => set({ activeSaasRegion }),
+  setRuntimeInfo: (info) =>
+    set((state) => ({
+      runtimePort: info.runtimePort,
+      portRole: info.portRole,
+      activePorts: info.activePorts ?? state.activePorts,
+    })),
+  setWsState: (wsConnected, wsLastRttMs) =>
+    set((state) => ({
+      wsConnected,
+      wsLastRttMs: wsLastRttMs === undefined ? state.wsLastRttMs : wsLastRttMs,
+    })),
 }));
+

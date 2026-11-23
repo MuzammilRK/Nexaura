@@ -1,0 +1,20 @@
+services:
+  nexaura:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexaura-platform
+    ports:
+      - "3000-3010:3000-3010"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - CLIENT_PORT=3001
+      - SAAS_PORT=3002
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      - nexaura_data:/app/.data
+    restart: unless-stopped
+
+volumes:
+  nexaura_data:

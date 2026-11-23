@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   ChevronUp,
@@ -12,12 +12,15 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { useNexauraStore } from '../state/useNexauraStore';
-import { ThreeWorldScene, type WorldDeviceNode } from './ThreeWorldScene';
+import { ThreeWorldScene, type ServerInfraMap, type WorldDeviceNode } from './ThreeWorldScene';
+import { MultiPortPanel } from './MultiPortPanel';
 import type { HealthState } from '../shared/schema';
 import { shortDeviceUid } from '../shared/formatters';
+import { getCountryAuthorityForDevice } from '../core/infra';
 
 interface TopologyResponse {
   devices: WorldDeviceNode[];
+  serverInfra?: ServerInfraMap;
   outageActive: boolean;
   spoolDepth: number;
 }
@@ -50,8 +53,17 @@ export function WorldExplorer() {
       if (!r.ok) throw new Error('Failed to load global topology');
       return r.json();
     },
-    refetchInterval: 6000,
+    refetchInterval: 30000,
+    refetchOnWindowFocus: false,
   });
+
+  const handleSelectFocus = useCallback((next: Parameters<typeof setWorldFocus>[0]) => {
+    setWorldFocus(next);
+  }, [setWorldFocus]);
+
+  const handleWebglUnavailable = useCallback(() => {
+    setViewMode2D(true);
+  }, [setViewMode2D]);
 
   const devices = data?.devices ?? [];
 
@@ -216,7 +228,8 @@ export function WorldExplorer() {
           </button>
         </nav>
 
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-2.5 shrink-0">
+          <MultiPortPanel />
           <button
             type="button"
             onClick={() => setScreen('super-login')}
@@ -290,10 +303,11 @@ export function WorldExplorer() {
         ) : (
           <ThreeWorldScene
             devices={devices}
+            serverInfra={data?.serverInfra}
             focus={worldFocus}
             reducedEffects={reducedEffects}
-            onSelectFocus={(next) => setWorldFocus(next)}
-            onWebglUnavailable={() => setViewMode2D(true)}
+            onSelectFocus={handleSelectFocus}
+            onWebglUnavailable={handleWebglUnavailable}
           />
         )}
 
@@ -321,45 +335,72 @@ export function WorldExplorer() {
         </div>
 
         {/* Selected Device Hand-off Card */}
-        {selectedDevice && (
-          <div className="absolute right-6 top-5 z-20 w-80 rounded-lg border border-[#293040] bg-[#12151C] p-4 shadow-2xl">
-            <div className="flex items-start justify-between gap-2">
-              <div>
-                <p className="text-[11px] font-medium text-blue-400">Selected Endpoint</p>
-                <h2 className="mt-0.5 text-sm font-semibold text-white">{selectedDevice.hostname}</h2>
-                <p className="font-mono text-[11px] text-zinc-400" title={selectedDevice.uid}>
-                  {shortDeviceUid(selectedDevice.uid)}
-                </p>
+        {selectedDevice && (() => {
+          const auth = getCountryAuthorityForDevice(selectedDevice);
+          const m = selectedDevice.metrics;
+          return (
+            <div className="absolute right-6 top-5 z-20 w-80 rounded-lg border border-[#293040] bg-[#12151C] p-4 shadow-2xl">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-[11px] font-medium text-blue-400">Selected Endpoint</p>
+                  <h2 className="mt-0.5 text-sm font-semibold text-white">{selectedDevice.hostname}</h2>
+                  <p className="font-mono text-[11px] text-zinc-400" title={selectedDevice.uid}>
+                    {shortDeviceUid(selectedDevice.uid)}
+                  </p>
+                </div>
+                <span
+                  className={`font-mono text-xs font-semibold ${
+                    HEALTH_TEXT_COLOR[m?.healthState ?? 'Good']
+                  }`}
+                >
+                  {m?.healthState ?? 'Good'}
+                </span>
               </div>
-              <span
-                className={`font-mono text-xs font-semibold ${
-                  HEALTH_TEXT_COLOR[selectedDevice.metrics?.healthState ?? 'Good']
-                }`}
+
+              <div className="mt-3 space-y-1.5 border-t border-[#222733] pt-3 text-xs text-zinc-300">
+                <div>{selectedDevice.buildingName} · Floor 0{selectedDevice.floorNumber}</div>
+                <div className="text-[11px] text-zinc-400">
+                  {selectedDevice.floorSwitchId} → {selectedDevice.buildingCoreId} → {selectedDevice.collectorId}
+                </div>
+                <div className="font-mono text-[11px] tabular-nums text-zinc-400">
+                  CPU {m?.cpuPct ?? 30}% · {m?.latencyMs ?? 20}ms · {m?.packetLossPct ?? 0}% loss
+                </div>
+                <div className="grid grid-cols-3 gap-1.5 pt-1 font-mono text-[10px]">
+                  <div className="rounded border border-[#222733] bg-[#0B0D11] px-2 py-1">
+                    <div className="text-zinc-500">Router</div>
+                    <div className={m?.router?.status === 'Nominal' ? 'text-emerald-400' : 'text-amber-400'}>
+                      {m?.router?.status ?? 'Nominal'}
+                    </div>
+                  </div>
+                  <div className="rounded border border-[#222733] bg-[#0B0D11] px-2 py-1">
+                    <div className="text-zinc-500">Storage</div>
+                    <div className={m?.storage?.status === 'Nominal' ? 'text-emerald-400' : 'text-amber-400'}>
+                      {m?.storage?.status ?? 'Nominal'}
+                    </div>
+                  </div>
+                  <div className="rounded border border-[#222733] bg-[#0B0D11] px-2 py-1">
+                    <div className="text-zinc-500">Cloud</div>
+                    <div className={m?.cloud?.status === 'Nominal' ? 'text-emerald-400' : 'text-amber-400'}>
+                      {m?.cloud?.status ?? 'Nominal'}
+                    </div>
+                  </div>
+                </div>
+                <div className="text-[11px] text-zinc-400 pt-0.5">
+                  Admin: <span className="font-mono text-zinc-200">{auth.adminUsername}</span> · Super: <span className="font-mono text-zinc-200">{auth.superAdminId}</span>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setScreen('device-login')}
+                className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-500 transition-colors"
               >
-                {selectedDevice.metrics?.healthState ?? 'Good'}
-              </span>
+                Connect to Device Shell
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
             </div>
-
-            <div className="mt-3 space-y-1.5 border-t border-[#222733] pt-3 text-xs text-zinc-300">
-              <div>{selectedDevice.buildingName} · Floor 0{selectedDevice.floorNumber}</div>
-              <div className="text-[11px] text-zinc-400">
-                {selectedDevice.floorSwitchId} → {selectedDevice.buildingCoreId} → {selectedDevice.collectorId}
-              </div>
-              <div className="font-mono text-[11px] tabular-nums text-zinc-400">
-                CPU {selectedDevice.metrics?.cpuPct ?? 30}% · {selectedDevice.metrics?.latencyMs ?? 20}ms · {selectedDevice.metrics?.packetLossPct ?? 0}% loss
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => setScreen('device-login')}
-              className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-500 transition-colors"
-            >
-              Connect to Device Shell
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
+          );
+        })()}
 
         {/* Collapsible Bottom Control Dock */}
         <div className="pointer-events-none fixed inset-x-0 bottom-4 z-20 flex justify-center px-3">

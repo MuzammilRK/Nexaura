@@ -14,7 +14,89 @@ export type IndustryType =
   | 'university'
   | 'datacenter';
 
-export type UserRole = 'device_operator' | 'tenant_admin' | 'super_admin';
+export type UserRole = 'device_operator' | 'tenant_admin' | 'country_admin' | 'super_admin';
+
+export type InfraStatus = 'Nominal' | 'Warning' | 'Critical' | 'Offline';
+
+export type RouterFaultCode =
+  | 'router_link_down'
+  | 'router_bgp_flap'
+  | 'router_packet_storm'
+  | 'router_nat_exhaustion'
+  | 'router_routing_loop';
+
+export type StorageFaultCode =
+  | 'storage_raid_degraded'
+  | 'storage_smart_warning'
+  | 'storage_nvme_saturated'
+  | 'storage_readonly_lock'
+  | 'storage_spool_full';
+
+export type CloudFaultCode = 'cloud_mtls_degraded' | 'cloud_sync_lag';
+
+export interface RouterTelemetry {
+  routerId: string;
+  status: InfraStatus;
+  dataTransferredMb: number;
+  packetCount: number;
+  packetsSent: number;
+  packetLossCount: number;
+  packetLossPct: number;
+  bandwidthMbps: number;
+  latencyMs: number;
+  activeError: RouterFaultCode | null;
+  errorDetail: string | null;
+}
+
+export interface StorageTelemetry {
+  storageId: string;
+  status: InfraStatus;
+  usedPct: number;
+  capacityGb: number;
+  iops: number;
+  readMbps: number;
+  writeMbps: number;
+  raidState: 'Healthy (RAID-10)' | 'Degraded Rebuild' | 'Read-Only Lock';
+  smartStatus: 'PASS' | 'PRE-FAIL WARNING' | 'SECTOR ERROR';
+  activeError: StorageFaultCode | null;
+  errorDetail: string | null;
+}
+
+export interface CloudSystemTelemetry {
+  cloudId: string;
+  status: InfraStatus;
+  provider: string;
+  regionEndpoint: RegionCode;
+  mtlsState: 'Verified' | 'Degraded' | 'Disconnected';
+  syncLatencyMs: number;
+  activeError: CloudFaultCode | null;
+  errorDetail: string | null;
+}
+
+export type AdminPermissionKey =
+  | 'cross_country_transfer'
+  | 'edit_health_thresholds'
+  | 'manage_server_faults'
+  | 'export_governance_logs';
+
+export interface CountryAdminRecord {
+  adminUsername: string;
+  displayName: string;
+  countryCode: string;
+  countryName: string;
+  region: RegionCode;
+  countrySuperAdminId: string;
+  permissions: Record<AdminPermissionKey, boolean>;
+  pendingRequests: {
+    requestId: string;
+    permission: AdminPermissionKey;
+    reason: string;
+    requestedAtUtc: string;
+    status: 'pending' | 'approved' | 'rejected';
+    decidedBy?: string;
+    decidedAtUtc?: string;
+  }[];
+}
 
 export const TelemetryCategorySchema = z.enum([
   'compute',
@@ -278,6 +360,9 @@ export interface LiveDeviceMetrics {
   lastHeartbeatUtc: string;
   healthState: HealthState;
   healthScore: number;
+  router?: RouterTelemetry;
+  storage?: StorageTelemetry;
+  cloud?: CloudSystemTelemetry;
 }
 
 export interface WindowsLogEntry {
@@ -363,6 +448,97 @@ export interface SessionInfo {
   role: UserRole;
   tenantId: string;
   region: RegionCode;
+  countryCode?: string;
   deviceUid?: string;
   expiresAtUtc: string;
 }
+
+export interface TenantCommPolicy {
+  tenantId: string;
+  region: RegionCode;
+  countryCode: string;
+  countryName: string;
+  cityCode: string;
+  cityName: string;
+  districtCode: string;
+  districtName: string;
+  allowOutsideDistrict: boolean;
+  allowOutsideCity: boolean;
+  allowOutsideCountry: boolean;
+  updatedBy?: string;
+  updatedAtUtc?: string;
+}
+
+export interface HostTelemetrySample {
+  timestampUtc: string;
+  hostname: string;
+  platform: string;
+  cpuModel: string;
+  cpuCores: number;
+  cpuPct: number;
+  memoryPct: number;
+  memoryUsedGb: number;
+  memoryTotalGb: number;
+  diskPct: number;
+  diskUsedGb: number;
+  diskTotalGb: number;
+  interfaceName: string;
+  rxBytesTotal: number;
+  txBytesTotal: number;
+  packetsRxTotal: number;
+  packetsTxTotal: number;
+  packetsDroppedTotal: number;
+  deltaBandwidthMbps: number;
+  deltaDataMb: number;
+  deltaPackets: number;
+  deltaPacketLoss: number;
+  loadAvg1m: number;
+  processRssMb: number;
+  uptimeSeconds: number;
+  sourceKind: 'linux-procfs' | 'os-fallback';
+}
+
+export type PortRole = 'hub' | 'client' | 'saas' | 'website';
+
+export interface ClusterPortBinding {
+  port: number;
+  role: PortRole;
+  label: string;
+  deviceUid?: string;
+  siteId?: string;
+  primary: boolean;
+  active: boolean;
+  wsClients: number;
+  requestsServed: number;
+  startedAtUtc: string;
+}
+
+export interface HostedWebsite {
+  siteId: string;
+  title: string;
+  description: string;
+  deviceUid: string;
+  tenantId: string;
+  html: string;
+  boundPort: number | null;
+  requestsCount: number;
+  lastStatus: number;
+  avgLatencyMs: number;
+  lastAccessedUtc: string | null;
+  updatedAtUtc: string;
+}
+
+export interface WebsiteProbeResult {
+  url: string;
+  statusCode: number;
+  ok: boolean;
+  latencyMs: number;
+  bytesReceived: number;
+  contentType: string;
+  title: string;
+  frameable: boolean;
+  frameRestrictionReason: string | null;
+  fetchedAtUtc: string;
+  deviceUid: string;
+}
+

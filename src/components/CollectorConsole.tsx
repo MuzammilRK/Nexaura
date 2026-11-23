@@ -12,15 +12,25 @@ import {
   Copy,
   Check,
   Zap,
+  Wrench,
+  Router as RouterIcon,
+  HardDrive,
+  Cloud,
+  UserCheck,
 } from 'lucide-react';
+import { TelemetryHealthVisuals } from './TelemetryHealthVisuals';
 import type {
+  CloudFaultCode,
   DeviceProfile,
   EgressProofRecord,
   HealthEvaluation,
+  InfraStatus,
   LiveDeviceMetrics,
+  RouterFaultCode,
   ScenarioRequest,
   ScenarioType,
   SpoolEntry,
+  StorageFaultCode,
   WindowsLogEntry,
 } from '../shared/schema';
 import { shortEventId, shortHash, shortTimeUtc } from '../shared/formatters';
@@ -34,10 +44,18 @@ export interface ReconcileSummary {
   matched: boolean;
 }
 
+export interface InfraCatalogOption {
+  code: string;
+  label: string;
+  severity: string;
+  description: string;
+}
+
 interface CollectorConsoleProps {
   device: DeviceProfile;
   metrics: LiveDeviceMetrics;
   health: HealthEvaluation;
+  metricHistory?: { cpu: number[]; latency: number[]; memory: number[] };
   rawLogs: WindowsLogEntry[];
   egressLog: EgressProofRecord[];
   spool: SpoolEntry[];
@@ -45,6 +63,15 @@ interface CollectorConsoleProps {
   outageActive: boolean;
   lastHeartbeatUtc: string;
   reconcile: ReconcileSummary;
+  assignedAdmin?: {
+    username: string;
+    displayName: string;
+    superAdminId: string;
+    countryName: string;
+    crossCountryGranted: boolean;
+  };
+  routerCatalog?: InfraCatalogOption[];
+  storageCatalog?: InfraCatalogOption[];
   token: string;
   onRefresh: () => void;
 }
@@ -87,9 +114,25 @@ function formatCleanPayloadPreview(serializedBytes: string): string {
   }
 }
 
+function infraDotClass(status?: InfraStatus): string {
+  if (status === 'Offline') return 'bg-zinc-400';
+  if (status === 'Critical') return 'bg-rose-500';
+  if (status === 'Warning') return 'bg-amber-400';
+  return 'bg-emerald-400';
+}
+
+function infraTextClass(status?: InfraStatus): string {
+  if (status === 'Offline') return 'text-zinc-400';
+  if (status === 'Critical') return 'text-rose-400';
+  if (status === 'Warning') return 'text-amber-400';
+  return 'text-emerald-400';
+}
+
 export function CollectorConsole({
   device,
+  metrics,
   health,
+  metricHistory,
   rawLogs,
   egressLog,
   spool,
@@ -97,6 +140,9 @@ export function CollectorConsole({
   outageActive,
   lastHeartbeatUtc,
   reconcile,
+  assignedAdmin,
+  routerCatalog = [],
+  storageCatalog = [],
   token,
   onRefresh,
 }: CollectorConsoleProps) {
@@ -107,6 +153,9 @@ export function CollectorConsole({
   const [showFullRawBytes, setShowFullRawBytes] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selectedAnomaly, setSelectedAnomaly] = useState<ScenarioType>('disk_io_saturation');
+  const [selectedRouterFault, setSelectedRouterFault] = useState<RouterFaultCode>('router_packet_storm');
+  const [selectedStorageFault, setSelectedStorageFault] = useState<StorageFaultCode>('storage_raid_degraded');
+  const [selectedCloudFault, setSelectedCloudFault] = useState<CloudFaultCode>('cloud_mtls_degraded');
 
   // Custom raw injection state
   const [rawMsg, setRawMsg] = useState(
@@ -174,6 +223,26 @@ export function CollectorConsole({
     }
   };
 
+  const resolveLocalFaults = async () => {
+    setBusyAction('resolve');
+    setActionFeedback(null);
+    try {
+      const res = await fetch('/api/fault/resolve', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ tenantId: device.tenantId, deviceUid: device.uid }),
+      });
+      const data = await res.json();
+      setActionFeedback(data.message || data.error || 'Resolved device faults.');
+      onRefresh();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const handleInjectRaw = async (e: FormEvent) => {
     e.preventDefault();
     if (!rawMsg.trim()) return;
@@ -232,8 +301,57 @@ export function CollectorConsole({
     }
   };
 
+  const injectInfraFault = async (component: 'router' | 'storage' | 'cloud', faultCode: string) => {
+    setBusyAction(`infra-${component}`);
+    setActionFeedback(null);
+    try {
+      const res = await fetch('/api/infra/fault', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          target: 'device',
+          component,
+          deviceUid: device.uid,
+          faultCode,
+        }),
+      });
+      const data = await res.json();
+      setActionFeedback(data.message || data.error || 'Infrastructure fault applied.');
+      onRefresh();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const resolveInfraFault = async (component: 'router' | 'storage' | 'cloud' | 'all') => {
+    setBusyAction(`resolve-${component}`);
+    setActionFeedback(null);
+    try {
+      const res = await fetch('/api/infra/resolve', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          target: 'device',
+          component,
+          deviceUid: device.uid,
+        }),
+      });
+      const data = await res.json();
+      setActionFeedback(data.message || data.error || 'Infrastructure restored.');
+      onRefresh();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   return (
-    <div className="flex h-full flex-col bg-[#0E1117] text-zinc-100">
+    <div className="flex min-h-full flex-col bg-[#0E1117] text-zinc-100">
       {/* Compact Status & Scenario Actions Bar */}
       <div className="border-b border-[#222733] bg-[#12151C] px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -337,6 +455,268 @@ export function CollectorConsole({
               <Zap className="h-3 w-3" />
               Inject Anomaly
             </button>
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={resolveLocalFaults}
+              className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1.5 text-xs font-medium text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
+            >
+              <Wrench className="h-3 w-3" />
+              Resolve Fault
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-3">
+          <TelemetryHealthVisuals
+            title={`${device.hostname} Telemetry Pulse`}
+            score={health.overallScore}
+            state={health.state}
+            subScores={health.subScores}
+            cpuPct={metrics.cpuPct}
+            memoryPct={metrics.memoryPct}
+            latencyMs={metrics.latencyMs}
+            diskPct={metrics.diskPct}
+            packetLossPct={metrics.packetLossPct}
+            failedLogins={metrics.failedLogins}
+            isStale={health.isStale}
+            cpuHistory={metricHistory?.cpu}
+            latencyHistory={metricHistory?.latency}
+            compact={true}
+          />
+        </div>
+
+        {/* Device Router, Storage Array & Cloud System Telemetry + Authority */}
+        <div className="mt-3 rounded-lg border border-[#222733] bg-[#0B0D11] p-3.5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1B202C] pb-2">
+            <div className="flex items-center gap-2 text-xs font-semibold text-white">
+              <span>Device Infrastructure Subsystems</span>
+            </div>
+            {assignedAdmin && (
+              <div className="inline-flex items-center gap-2 font-mono text-[11px] text-zinc-400">
+                <UserCheck className="h-3.5 w-3.5 text-blue-400" />
+                <span>
+                  Country Admin: <strong className="text-zinc-200">{assignedAdmin.username}</strong> · Super Admin:{' '}
+                  <strong className="text-zinc-200">{assignedAdmin.superAdminId}</strong>
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-3">
+            {/* Device Router Card */}
+            {metrics.router && (
+              <div className="rounded-md border border-[#222733] bg-[#12151C] p-3 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-white">
+                    <span className={`h-2.5 w-2.5 rounded-full ${infraDotClass(metrics.router.status)}`} />
+                    <RouterIcon className="h-3.5 w-3.5 text-blue-400" />
+                    Edge Router
+                  </span>
+                  <span className={`font-mono text-[11px] font-semibold ${infraTextClass(metrics.router.status)}`}>
+                    {metrics.router.status}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[11px] text-zinc-300 tabular-nums">
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Data</span>
+                    <span>{metrics.router.dataTransferredMb.toFixed(1)} MB</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Packets</span>
+                    <span>{metrics.router.packetCount.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Sent</span>
+                    <span className="text-emerald-400">{metrics.router.packetsSent.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Loss</span>
+                    <span className={metrics.router.packetLossPct > 1 ? 'text-rose-400' : 'text-zinc-200'}>
+                      {metrics.router.packetLossCount} ({metrics.router.packetLossPct}%)
+                    </span>
+                  </div>
+                </div>
+                {metrics.router.errorDetail && (
+                  <div className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200">
+                    {metrics.router.errorDetail}
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-[#1D222D]">
+                  <select
+                    aria-label="Device router fault"
+                    value={selectedRouterFault}
+                    onChange={(e) => setSelectedRouterFault(e.target.value as RouterFaultCode)}
+                    className="min-w-0 flex-1 rounded border border-[#2B3242] bg-[#0B0D11] px-2 py-1 text-[11px] text-zinc-200"
+                  >
+                    {(routerCatalog.length > 0
+                      ? routerCatalog
+                      : [{ code: 'router_packet_storm', label: 'CRC Packet Loss Storm' }]
+                    ).map((opt) => (
+                      <option key={opt.code} value={opt.code}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void injectInfraFault('router', selectedRouterFault)}
+                    className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/25"
+                  >
+                    Fault
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void resolveInfraFault('router')}
+                    className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/25"
+                  >
+                    Fix
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Device Storage Card */}
+            {metrics.storage && (
+              <div className="rounded-md border border-[#222733] bg-[#12151C] p-3 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-white">
+                    <span className={`h-2.5 w-2.5 rounded-full ${infraDotClass(metrics.storage.status)}`} />
+                    <HardDrive className="h-3.5 w-3.5 text-emerald-400" />
+                    Local Storage
+                  </span>
+                  <span className={`font-mono text-[11px] font-semibold ${infraTextClass(metrics.storage.status)}`}>
+                    {metrics.storage.status}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[11px] text-zinc-300 tabular-nums">
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Used</span>
+                    <span>
+                      {metrics.storage.usedPct}% / {metrics.storage.capacityGb}G
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">IOPS</span>
+                    <span>{metrics.storage.iops.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">RAID</span>
+                    <span className="truncate max-w-[95px]">{metrics.storage.raidState.split(' ')[0]}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">SMART</span>
+                    <span className={metrics.storage.smartStatus === 'PASS' ? 'text-emerald-400' : 'text-amber-400'}>
+                      {metrics.storage.smartStatus}
+                    </span>
+                  </div>
+                </div>
+                {metrics.storage.errorDetail && (
+                  <div className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200">
+                    {metrics.storage.errorDetail}
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-[#1D222D]">
+                  <select
+                    aria-label="Device storage fault"
+                    value={selectedStorageFault}
+                    onChange={(e) => setSelectedStorageFault(e.target.value as StorageFaultCode)}
+                    className="min-w-0 flex-1 rounded border border-[#2B3242] bg-[#0B0D11] px-2 py-1 text-[11px] text-zinc-200"
+                  >
+                    {(storageCatalog.length > 0
+                      ? storageCatalog
+                      : [{ code: 'storage_raid_degraded', label: 'RAID-10 Degraded Rebuild' }]
+                    ).map((opt) => (
+                      <option key={opt.code} value={opt.code}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void injectInfraFault('storage', selectedStorageFault)}
+                    className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/25"
+                  >
+                    Fault
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void resolveInfraFault('storage')}
+                    className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/25"
+                  >
+                    Fix
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Cloud Gateway Card */}
+            {metrics.cloud && (
+              <div className="rounded-md border border-[#222733] bg-[#12151C] p-3 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-white">
+                    <span className={`h-2.5 w-2.5 rounded-full ${infraDotClass(metrics.cloud.status)}`} />
+                    <Cloud className="h-3.5 w-3.5 text-sky-400" />
+                    Cloud Uplink
+                  </span>
+                  <span className={`font-mono text-[11px] font-semibold ${infraTextClass(metrics.cloud.status)}`}>
+                    {metrics.cloud.status}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[11px] text-zinc-300 tabular-nums">
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Endpoint</span>
+                    <span>{metrics.cloud.regionEndpoint}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">mTLS</span>
+                    <span className={metrics.cloud.mtlsState === 'Verified' ? 'text-emerald-400' : 'text-amber-400'}>
+                      {metrics.cloud.mtlsState}
+                    </span>
+                  </div>
+                  <div className="flex justify-between col-span-2">
+                    <span className="text-zinc-500">Sync Latency</span>
+                    <span>{metrics.cloud.syncLatencyMs} ms</span>
+                  </div>
+                </div>
+                {metrics.cloud.errorDetail && (
+                  <div className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200">
+                    {metrics.cloud.errorDetail}
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-[#1D222D]">
+                  <select
+                    aria-label="Device cloud fault"
+                    value={selectedCloudFault}
+                    onChange={(e) => setSelectedCloudFault(e.target.value as CloudFaultCode)}
+                    className="min-w-0 flex-1 rounded border border-[#2B3242] bg-[#0B0D11] px-2 py-1 text-[11px] text-zinc-200"
+                  >
+                    <option value="cloud_mtls_degraded">Cloud mTLS Jitter</option>
+                    <option value="cloud_sync_lag">Cloud Sync Lag (&gt;200ms)</option>
+                  </select>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void injectInfraFault('cloud', selectedCloudFault)}
+                    className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/25"
+                  >
+                    Fault
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void resolveInfraFault('cloud')}
+                    className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[11px] font-medium text-emerald-200 hover:bg-emerald-500/25"
+                  >
+                    Fix
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -379,7 +759,7 @@ export function CollectorConsole({
       </div>
 
       {/* Tab Body */}
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+      <div className="p-4">
         {tab === 'egress' && (
           <div className="grid gap-4 lg:grid-cols-12">
             {/* Compact Event List */}

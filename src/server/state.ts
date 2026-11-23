@@ -3,7 +3,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   DEFAULT_HEALTH_THRESHOLDS,
+  type AdminPermissionKey,
   type AllowListedPayload,
+  type CloudFaultCode,
+  type CloudSystemTelemetry,
+  type CountryAdminRecord,
   type EgressProofRecord,
   type EncryptedFileTransfer,
   type HealthThresholds,
@@ -12,10 +16,16 @@ import {
   type LogCategory,
   type RegionCode,
   type RemediationRecord,
+  type RouterFaultCode,
+  type RouterTelemetry,
   type ScenarioRequest,
+  type ScenarioType,
   type Severity,
   type SpoolEntry,
+  type StorageFaultCode,
+  type StorageTelemetry,
   type StructuredLogEntry,
+  type TenantCommPolicy,
   type WindowsLogEntry,
 } from '../shared/schema';
 import { GLOBAL_TOPOLOGY, getCityTimezone } from '../shared/topology';
@@ -26,6 +36,19 @@ import {
   detectSeasonalAnomaly,
   evaluateHealth,
 } from '../core/aiops';
+import {
+  advanceRouterTraffic,
+  applyCloudFault,
+  applyRouterFault,
+  applyStorageFault,
+  buildDefaultCountryAdmins,
+  computeRouterStatus,
+  computeStorageStatus,
+  resolveCloudFault,
+  resolveRouterFault,
+  resolveStorageFault,
+} from '../core/infra';
+import { buildDefaultTenantCommPolicy, canNodesCommunicate } from '../core/policy';
 import { processCollectorEvent } from '../core/pipeline';
 import { canonicalSerialize, sha256Hex } from '../core/redactor';
 import {
@@ -35,6 +58,8 @@ import {
   nextRetryBackoffMs,
   sortByEventTimeUtc,
 } from '../core/spool';
+import { hostTelemetrySampler } from './telemetrySource';
+import { clusterCoordinator } from './cluster';
 
 const DATA_DIR = path.resolve(process.cwd(), '.data');
 const STATE_FILE = path.join(DATA_DIR, 'nexaura-wal-state.json');
@@ -55,6 +80,7 @@ interface PersistedSnapshot {
 class NexauraEngine {
   public deviceMetrics = new Map<string, LiveDeviceMetrics>();
   public metricHistories = new Map<string, number[]>();
+  public tenantCommPolicies = new Map<string, TenantCommPolicy>();
   public localRawLogs = new Map<string, WindowsLogEntry[]>(); // Strictly local to Tier 1 Collector!
   public outageActive = false;
   public spool: SpoolEntry[] = [];
@@ -76,6 +102,130 @@ class NexauraEngine {
   public structuredLogs: StructuredLogEntry[] = [];
   public thresholds: HealthThresholds = { ...DEFAULT_HEALTH_THRESHOLDS };
   public lastCollectorHeartbeatUtc = new Date().toISOString();
+  public countryAdmins: CountryAdminRecord[] = buildDefaultCountryAdmins();
+  public serverInfra: Record<
+    RegionCode,
+    {
+      router: RouterTelemetry;
+      storage: StorageTelemetry;
+      cloud: CloudSystemTelemetry;
+    }
+  > = {
+    IN: {
+      router: {
+        routerId: 'rtr-core-in-01',
+        status: 'Nominal',
+        dataTransferredMb: 4820.4,
+        packetCount: 384200,
+        packetsSent: 384112,
+        packetLossCount: 88,
+        packetLossPct: 0.02,
+        bandwidthMbps: 1420,
+        latencyMs: 18.4,
+        activeError: null,
+        errorDetail: null,
+      },
+      storage: {
+        storageId: 'stg-vault-in-01',
+        status: 'Nominal',
+        usedPct: 46.2,
+        capacityGb: 8192,
+        iops: 6400,
+        readMbps: 890,
+        writeMbps: 420,
+        raidState: 'Healthy (RAID-10)',
+        smartStatus: 'PASS',
+        activeError: null,
+        errorDetail: null,
+      },
+      cloud: {
+        cloudId: 'cld-mesh-in-mumbai',
+        status: 'Nominal',
+        provider: 'Nexaura Sovereign Cloud (IN)',
+        regionEndpoint: 'IN',
+        mtlsState: 'Verified',
+        syncLatencyMs: 19,
+        activeError: null,
+        errorDetail: null,
+      },
+    },
+    EU: {
+      router: {
+        routerId: 'rtr-core-eu-01',
+        status: 'Nominal',
+        dataTransferredMb: 3910.8,
+        packetCount: 312450,
+        packetsSent: 312380,
+        packetLossCount: 70,
+        packetLossPct: 0.02,
+        bandwidthMbps: 1280,
+        latencyMs: 22.1,
+        activeError: null,
+        errorDetail: null,
+      },
+      storage: {
+        storageId: 'stg-vault-eu-01',
+        status: 'Nominal',
+        usedPct: 51.4,
+        capacityGb: 8192,
+        iops: 5800,
+        readMbps: 760,
+        writeMbps: 380,
+        raidState: 'Healthy (RAID-10)',
+        smartStatus: 'PASS',
+        activeError: null,
+        errorDetail: null,
+      },
+      cloud: {
+        cloudId: 'cld-mesh-eu-frankfurt',
+        status: 'Nominal',
+        provider: 'Nexaura Sovereign Cloud (EU)',
+        regionEndpoint: 'EU',
+        mtlsState: 'Verified',
+        syncLatencyMs: 23,
+        activeError: null,
+        errorDetail: null,
+      },
+    },
+    US: {
+      router: {
+        routerId: 'rtr-core-us-01',
+        status: 'Nominal',
+        dataTransferredMb: 4185.2,
+        packetCount: 338900,
+        packetsSent: 338818,
+        packetLossCount: 82,
+        packetLossPct: 0.02,
+        bandwidthMbps: 1350,
+        latencyMs: 20.8,
+        activeError: null,
+        errorDetail: null,
+      },
+      storage: {
+        storageId: 'stg-vault-us-01',
+        status: 'Nominal',
+        usedPct: 49.0,
+        capacityGb: 8192,
+        iops: 6150,
+        readMbps: 840,
+        writeMbps: 405,
+        raidState: 'Healthy (RAID-10)',
+        smartStatus: 'PASS',
+        activeError: null,
+        errorDetail: null,
+      },
+      cloud: {
+        cloudId: 'cld-mesh-us-virginia',
+        status: 'Nominal',
+        provider: 'Nexaura Sovereign Cloud (US)',
+        regionEndpoint: 'US',
+        mtlsState: 'Verified',
+        syncLatencyMs: 21,
+        activeError: null,
+        errorDetail: null,
+      },
+    },
+  };
   public latencySamples: {
     payloadId: string;
     collectionMs: number;
@@ -85,6 +235,9 @@ class NexauraEngine {
 
   private tickHandle: NodeJS.Timeout | null = null;
   private tickCounter = 0;
+  private faultLatchedUids = new Set<string>();
+  private clientLiveOverrides = new Map<string, { latencyMs?: number; bandwidthMbps?: number; updatedAtMs: number; source: string }>();
+  public latestHostSample = hostTelemetrySampler.sample();
 
   constructor() {
     this.initDevices();
@@ -95,29 +248,82 @@ class NexauraEngine {
 
   private initDevices(): void {
     const nowIso = new Date().toISOString();
+    const hostSample = this.latestHostSample;
     for (let i = 0; i < GLOBAL_TOPOLOGY.length; i++) {
       const d = GLOBAL_TOPOLOGY[i];
-      const baseCpu = 24 + ((i * 7) % 34);
-      const baseMem = 36 + ((i * 11) % 32);
-      const baseLat = d.region === 'IN' ? 18 + (i % 15) : d.region === 'EU' ? 24 + (i % 18) : 21 + (i % 16);
+      const baseCpu = Number(Math.max(4, Math.min(92, hostSample.cpuPct + (i % 7) * 0.6)).toFixed(1));
+      const baseMem = Number(Math.max(12, Math.min(92, hostSample.memoryPct + (i % 5) * 0.5)).toFixed(1));
+      const baseDisk = Number(Math.max(10, Math.min(94, hostSample.diskPct)).toFixed(1));
+      const baseBw = Number(Math.max(1.2, hostSample.deltaBandwidthMbps + (i === 0 ? 0 : 12 + (i % 6) * 4)).toFixed(1));
+      const baseLat = i === 0 ? 4.2 : 12 + (i % 9);
+      const baseLoss = 0;
+      const basePktCount = Math.max(120, hostSample.packetsRxTotal + hostSample.packetsTxTotal);
+      const baseLossCount = hostSample.packetsDroppedTotal;
+      const router: RouterTelemetry = {
+        routerId: `rtr-${d.cityCode.toLowerCase()}-${d.buildingCode.toLowerCase()}-${String(i + 1).padStart(2, '0')}`,
+        status: 'Nominal',
+        dataTransferredMb: Number((184.5 + i * 14.2).toFixed(2)),
+        packetCount: basePktCount,
+        packetsSent: basePktCount - baseLossCount,
+        packetLossCount: baseLossCount,
+        packetLossPct: baseLoss,
+        bandwidthMbps: baseBw,
+        latencyMs: baseLat,
+        activeError: null,
+        errorDetail: null,
+      };
+      router.status = computeRouterStatus(router);
+
+      const storage: StorageTelemetry = {
+        storageId: `stg-${d.cityCode.toLowerCase()}-${String(i + 1).padStart(2, '0')}`,
+        status: 'Nominal',
+        usedPct: baseDisk,
+        capacityGb: d.industry === 'datacenter' ? 4096 : 1024,
+        iops: 2400 + (i % 8) * 180,
+        readMbps: 340 + (i % 6) * 35,
+        writeMbps: 175 + (i % 5) * 20,
+        raidState: 'Healthy (RAID-10)',
+        smartStatus: 'PASS',
+        activeError: null,
+        errorDetail: null,
+      };
+      storage.status = computeStorageStatus(storage);
+
+      const cloud: CloudSystemTelemetry = {
+        cloudId: `cld-${d.region.toLowerCase()}-${d.cityCode.toLowerCase()}`,
+        status: 'Nominal',
+        provider: `Nexaura Cloud Sync (${d.region})`,
+        regionEndpoint: d.region,
+        mtlsState: 'Verified',
+        syncLatencyMs: 18 + (i % 9),
+        activeError: null,
+        errorDetail: null,
+      };
+
       const m: LiveDeviceMetrics = {
         uid: d.uid,
         cpuPct: baseCpu,
         memoryPct: baseMem,
-        diskPct: 42 + ((i * 5) % 30),
-        bandwidthMbps: 110 + ((i * 13) % 240),
+        diskPct: baseDisk,
+        bandwidthMbps: baseBw,
         latencyMs: baseLat,
-        packetLossPct: Number(((i % 5) * 0.08).toFixed(2)),
+        packetLossPct: baseLoss,
         failedLogins: 0,
         online: true,
         lastHeartbeatUtc: nowIso,
         healthState: 'Excellent',
         healthScore: 95,
+        router,
+        storage,
+        cloud,
       };
       const evalRes = evaluateHealth(m, Date.now(), this.thresholds);
       m.healthState = evalRes.state;
       m.healthScore = evalRes.overallScore;
       this.deviceMetrics.set(d.uid, m);
+      if (!this.tenantCommPolicies.has(d.tenantId)) {
+        this.tenantCommPolicies.set(d.tenantId, buildDefaultTenantCommPolicy(d));
+      }
       this.metricHistories.set(`${d.pseudoSourceId}:cpu_pct`, [baseCpu - 2, baseCpu - 1, baseCpu, baseCpu + 1, baseCpu]);
       this.metricHistories.set(`${d.pseudoSourceId}:memory_pct`, [baseMem - 1, baseMem, baseMem + 1, baseMem, baseMem]);
       this.metricHistories.set(`${d.pseudoSourceId}:latency_ms`, [baseLat - 1, baseLat, baseLat + 2, baseLat, baseLat]);
@@ -211,7 +417,19 @@ class NexauraEngine {
   private seedInitialPipeline(): void {
     const nowIso = new Date().toISOString();
     const flagship = GLOBAL_TOPOLOGY[0];
-    const peerSameTenant = GLOBAL_TOPOLOGY.find((d) => d.uid !== flagship.uid && d.tenantId === flagship.tenantId) ?? GLOBAL_TOPOLOGY[1];
+    const peerSameTenant =
+      GLOBAL_TOPOLOGY.find(
+        (d) =>
+          d.uid !== flagship.uid &&
+          d.tenantId === flagship.tenantId &&
+          d.districtCode === flagship.districtCode &&
+          d.cityCode === flagship.cityCode &&
+          d.countryCode === flagship.countryCode
+      ) ??
+      GLOBAL_TOPOLOGY.find(
+        (d) => d.uid !== flagship.uid && d.tenantId === flagship.tenantId
+      ) ??
+      GLOBAL_TOPOLOGY[1];
     const peerOtherTenant = GLOBAL_TOPOLOGY.find((d) => d.tenantId !== flagship.tenantId && d.region === 'IN') ?? GLOBAL_TOPOLOGY[3];
 
     if (this.structuredLogs.length === 0) {
@@ -275,11 +493,11 @@ class NexauraEngine {
     }
 
     if (this.fileTransfers.length === 0) {
-      // Seed one outbound (sent from flagship) and two inbound (received by flagship) encrypted transfers
+      // Seed one outbound (sent from flagship) and one inbound (received by flagship) encrypted transfer within same building/district
       this.createFileTransfer(flagship.uid, peerSameTenant.uid, 'Q4-settlement-audit.enc', 'S (10-100KB)', false);
       this.createFileTransfer(peerSameTenant.uid, flagship.uid, 'treasury-reconcile-batch.enc', 'M (100KB-1MB)', false);
-      this.createFileTransfer(peerOtherTenant.uid, flagship.uid, 'interop-compliance-pack.enc', 'S (10-100KB)', true);
     }
+    void peerOtherTenant;
 
     if (this.egressLog.length > 0) {
       this.recomputeIncidents();
@@ -352,6 +570,7 @@ class NexauraEngine {
     severity: Severity;
     summary: string;
     action?: string;
+    details?: Record<string, string | number | boolean>;
   }): StructuredLogEntry {
     const dev = params.deviceUid ? GLOBAL_TOPOLOGY.find((d) => d.uid === params.deviceUid) : undefined;
     const entry = this.recordStructuredLog({
@@ -365,6 +584,7 @@ class NexauraEngine {
       action: params.action || `MANUAL_${params.category.toUpperCase()}_LOG`,
       severity: params.severity,
       summary: params.summary,
+      details: params.details,
     });
     this.auditEvents.unshift({
       timestampUtc: entry.timestampUtc,
@@ -379,7 +599,82 @@ class NexauraEngine {
     if (this.tickHandle) return;
     this.tickHandle = setInterval(() => {
       this.runSimulationTick();
-    }, 3500);
+    }, 2000);
+  }
+
+  public ingestLiveClientSample(params: {
+    deviceUid: string;
+    cpuPct?: number;
+    memoryPct?: number;
+    latencyMs?: number;
+    bandwidthMbps?: number;
+    dataDeltaMb?: number;
+    packetDelta?: number;
+    source?: string;
+    dispatchEvent?: boolean;
+  }): { ok: boolean; metrics?: LiveDeviceMetrics } {
+    const dev = GLOBAL_TOPOLOGY.find((d) => d.uid === params.deviceUid);
+    const m = dev ? this.deviceMetrics.get(dev.uid) : undefined;
+    if (!dev || !m) return { ok: false };
+
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    m.online = true;
+    m.lastHeartbeatUtc = nowIso;
+
+    if (typeof params.cpuPct === 'number' && Number.isFinite(params.cpuPct)) {
+      m.cpuPct = Number(Math.max(1, Math.min(99.9, params.cpuPct)).toFixed(1));
+    }
+    if (typeof params.memoryPct === 'number' && Number.isFinite(params.memoryPct)) {
+      m.memoryPct = Number(Math.max(1, Math.min(99.9, params.memoryPct)).toFixed(1));
+    }
+    if (typeof params.latencyMs === 'number' && Number.isFinite(params.latencyMs) && !m.router?.activeError) {
+      m.latencyMs = Number(Math.max(0.5, Math.min(2000, params.latencyMs)).toFixed(1));
+    }
+    if (typeof params.bandwidthMbps === 'number' && Number.isFinite(params.bandwidthMbps) && m.router?.activeError !== 'router_link_down') {
+      m.bandwidthMbps = Number(Math.max(0.1, Math.min(10000, params.bandwidthMbps)).toFixed(1));
+    }
+
+    this.clientLiveOverrides.set(dev.uid, {
+      latencyMs: params.latencyMs,
+      bandwidthMbps: params.bandwidthMbps,
+      updatedAtMs: now,
+      source: params.source ?? 'live-client',
+    });
+
+    if (m.router && ((params.dataDeltaMb ?? 0) > 0 || (params.packetDelta ?? 0) > 0)) {
+      m.router = advanceRouterTraffic(m.router, params.dataDeltaMb ?? 0.02, params.packetDelta ?? 4);
+      m.router.latencyMs = m.latencyMs;
+      m.router.bandwidthMbps = m.bandwidthMbps;
+    }
+
+    const ev = evaluateHealth(m, now, this.thresholds);
+    m.healthState = ev.state;
+    m.healthScore = ev.overallScore;
+
+    if (params.dispatchEvent) {
+      this.collectAndDispatch({
+        rawId: `live-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        deviceUid: dev.uid,
+        tenantId: dev.tenantId,
+        region: dev.region,
+        eventTimeUtc: nowIso,
+        sourceTz: getCityTimezone(dev.cityCode),
+        category: 'network',
+        metric: 'latency_ms',
+        value: m.latencyMs,
+        severity: m.latencyMs > 180 ? 'high' : 'low',
+        rawMessage: `Live client probe (${params.source ?? 'browser'}) on ${dev.hostname}: cpu=${m.cpuPct}% mem=${m.memoryPct}% rtt=${m.latencyMs}ms`,
+        injectedAtMs: now,
+      });
+    }
+
+    clusterCoordinator.broadcast('device:updated', {
+      deviceUid: dev.uid,
+      region: dev.region,
+      tenantId: dev.tenantId,
+    });
+    return { ok: true, metrics: m };
   }
 
   public runSimulationTick(): void {
@@ -388,21 +683,60 @@ class NexauraEngine {
     const nowIso = new Date(now).toISOString();
     this.lastCollectorHeartbeatUtc = nowIso;
 
-    // Advance metrics gently for all devices
+    // Sample genuine OS / Linux /proc host & network telemetry
+    const live = hostTelemetrySampler.sample();
+    this.latestHostSample = live;
+
     for (let i = 0; i < GLOBAL_TOPOLOGY.length; i++) {
       const dev = GLOBAL_TOPOLOGY[i];
       const m = this.deviceMetrics.get(dev.uid);
       if (!m) continue;
 
-      const jitter = Math.sin((this.tickCounter + i) * 0.7) * 2.8;
-      m.cpuPct = Number(Math.max(8, Math.min(99, m.cpuPct * 0.88 + (28 + (i % 25) + jitter) * 0.12)).toFixed(1));
-      m.memoryPct = Number(Math.max(18, Math.min(99, m.memoryPct * 0.92 + (42 + (i % 22) + jitter * 0.5) * 0.08)).toFixed(1));
-      m.latencyMs = Number(Math.max(8, Math.min(450, m.latencyMs * 0.85 + (20 + (i % 16) + Math.abs(jitter) * 1.4) * 0.15)).toFixed(1));
-      if (m.failedLogins > 0 && this.tickCounter % 5 === 0) {
+      const latched = this.faultLatchedUids.has(dev.uid);
+      const clientOverride = this.clientLiveOverrides.get(dev.uid);
+      const hasFreshClientProbe = Boolean(clientOverride && now - clientOverride.updatedAtMs < 15_000);
+
+      if (!latched && m.online) {
+        m.cpuPct = Number(Math.max(1, Math.min(99, live.cpuPct + (i === 0 ? 0 : (i % 5) * 0.4))).toFixed(1));
+        m.memoryPct = Number(Math.max(5, Math.min(99, live.memoryPct + (i === 0 ? 0 : (i % 4) * 0.3))).toFixed(1));
+        m.diskPct = live.diskPct;
+        if (!hasFreshClientProbe && !m.router?.activeError) {
+          m.bandwidthMbps = Number(Math.max(0.2, live.deltaBandwidthMbps).toFixed(1));
+          m.latencyMs = Number(Math.max(1.2, 2.5 + live.loadAvg1m * 1.8).toFixed(1));
+        }
+      }
+
+      if (m.failedLogins > 0 && this.tickCounter % 8 === 0) {
         m.failedLogins = Math.max(0, m.failedLogins - 1);
       }
       if (m.online) {
         m.lastHeartbeatUtc = nowIso;
+      }
+
+      if (m.router) {
+        const deltaMb = i === 0 ? live.deltaDataMb : Number((live.deltaDataMb * 0.15).toFixed(4));
+        const deltaPkts = i === 0 ? live.deltaPackets : Math.max(1, Math.round(live.deltaPackets * 0.2));
+        m.router = advanceRouterTraffic(m.router, deltaMb, deltaPkts);
+        m.router.bandwidthMbps = m.router.activeError === 'router_link_down' ? 0 : m.bandwidthMbps;
+        m.router.latencyMs = m.router.activeError === 'router_link_down' ? 999 : m.latencyMs;
+        if (m.router.activeError) {
+          m.packetLossPct = m.router.packetLossPct;
+        }
+      }
+      if (m.storage && !m.storage.activeError) {
+        m.storage.usedPct = live.diskPct;
+      }
+      if (m.cloud) {
+        m.cloud.status = this.outageActive
+          ? 'Offline'
+          : m.cloud.activeError
+            ? m.cloud.status
+            : 'Nominal';
+        m.cloud.mtlsState = this.outageActive
+          ? 'Disconnected'
+          : m.cloud.activeError === 'cloud_mtls_degraded'
+            ? 'Degraded'
+            : 'Verified';
       }
 
       const ev = evaluateHealth(m, now, this.thresholds);
@@ -418,30 +752,54 @@ class NexauraEngine {
       latHist.push(m.latencyMs);
       if (latHist.length > 24) latHist.shift();
       this.metricHistories.set(`${dev.pseudoSourceId}:latency_ms`, latHist);
+
+      const memHist = this.metricHistories.get(`${dev.pseudoSourceId}:memory_pct`) ?? [];
+      memHist.push(m.memoryPct);
+      if (memHist.length > 24) memHist.shift();
+      this.metricHistories.set(`${dev.pseudoSourceId}:memory_pct`, memHist);
     }
 
-    // Collect telemetry from a rotating device + flagship device
+    for (const region of ['IN', 'EU', 'US'] as RegionCode[]) {
+      const srv = this.serverInfra[region];
+      srv.router = advanceRouterTraffic(
+        srv.router,
+        this.outageActive ? 0.001 : live.deltaDataMb,
+        this.outageActive ? 1 : live.deltaPackets
+      );
+      if (!srv.storage.activeError) {
+        srv.storage.usedPct = live.diskPct;
+      }
+      srv.cloud.status = this.outageActive ? 'Offline' : srv.cloud.activeError ? srv.cloud.status : 'Nominal';
+      srv.cloud.mtlsState = this.outageActive
+        ? 'Disconnected'
+        : srv.cloud.activeError === 'cloud_mtls_degraded'
+          ? 'Degraded'
+          : 'Verified';
+    }
+
+    // Collect live telemetry from rotating node + flagship device
     const targetDev = GLOBAL_TOPOLOGY[this.tickCounter % Math.min(8, GLOBAL_TOPOLOGY.length)];
     const targetMetrics = this.deviceMetrics.get(targetDev.uid);
     if (targetMetrics && targetMetrics.online) {
+      const useCpu = this.tickCounter % 2 === 0;
       this.collectAndDispatch({
-        rawId: `sim-${this.tickCounter}-${targetDev.uid.slice(-4)}`,
+        rawId: `live-${this.tickCounter}-${targetDev.uid.slice(-4)}`,
         deviceUid: targetDev.uid,
         tenantId: targetDev.tenantId,
         region: targetDev.region,
         eventTimeUtc: nowIso,
         sourceTz: getCityTimezone(targetDev.cityCode),
-        category: this.tickCounter % 2 === 0 ? 'compute' : 'network',
-        metric: this.tickCounter % 2 === 0 ? 'cpu_pct' : 'latency_ms',
-        value: this.tickCounter % 2 === 0 ? targetMetrics.cpuPct : targetMetrics.latencyMs,
+        category: useCpu ? 'compute' : 'network',
+        metric: useCpu ? 'cpu_pct' : 'latency_ms',
+        value: useCpu ? targetMetrics.cpuPct : targetMetrics.latencyMs,
         severity:
           targetMetrics.healthState === 'Poor'
             ? 'high'
             : targetMetrics.healthState === 'Fair'
               ? 'medium'
               : 'low',
-        rawMessage: `Periodic collector sample from ${targetDev.hostname}: cpu=${targetMetrics.cpuPct}% lat=${targetMetrics.latencyMs}ms`,
-        injectedAtMs: now - 40,
+        rawMessage: `Live host sample (${live.sourceKind} · ${live.interfaceName}) for ${targetDev.hostname}: cpu=${targetMetrics.cpuPct}% mem=${targetMetrics.memoryPct}% lat=${targetMetrics.latencyMs}ms`,
+        injectedAtMs: now - 12,
       });
     }
 
@@ -449,6 +807,11 @@ class NexauraEngine {
     if (!this.outageActive && this.spool.length > 0) {
       this.drainSpoolBatch(now);
     }
+
+    clusterCoordinator.broadcast('telemetry:tick', {
+      region: targetDev.region,
+      deviceUid: targetDev.uid,
+    });
   }
 
   public collectAndDispatch(
@@ -488,6 +851,15 @@ class NexauraEngine {
       });
       this.persistWal();
       return record;
+    }
+
+    // Advance device router and regional server core router packet/data counters
+    if (metrics.router) {
+      metrics.router = advanceRouterTraffic(metrics.router, 0.42, 12);
+    }
+    const srvInfra = this.serverInfra[dev.region];
+    if (srvInfra?.router) {
+      srvInfra.router = advanceRouterTraffic(srvInfra.router, 0.42, 12);
     }
 
     // Payload passed Allow-list & Last-gate; track sentId
@@ -764,6 +1136,11 @@ class NexauraEngine {
         summary: msg,
       });
       this.persistWal();
+      clusterCoordinator.broadcast('device:updated', {
+        deviceUid: primary.uid,
+        region: primary.region,
+        tenantId: primary.tenantId,
+      });
       return { message: msg, records };
     }
 
@@ -774,6 +1151,7 @@ class NexauraEngine {
       }
       const res = this.deliverToRegionalSaas(primary.region, [existing, existing]);
       this.persistWal();
+      clusterCoordinator.broadcast('incident:updated', { region: primary.region });
       return {
         message: `Replayed payload ${existing.payloadId} twice -> accepted: ${res.acceptedCount}, duplicates blocked: ${res.dupesCount}.`,
         records,
@@ -788,6 +1166,9 @@ class NexauraEngine {
       const tz = getCityTimezone(dev.cityCode);
       const tNow = now + idx * 35;
       impactedTenants.push(dev.tenantId);
+      if (req.type !== 'secret_in_log' && req.type !== 'out_of_order_delivery' && req.type !== 'clock_skew') {
+        this.faultLatchedUids.add(dev.uid);
+      }
 
       switch (req.type) {
         case 'secret_in_log': {
@@ -1150,6 +1531,13 @@ class NexauraEngine {
       summary: `Executed "${req.type}" simulation across ${impactedTenants.length} tenant(s): ${impactedTenants.join(', ')}.`,
     });
 
+    clusterCoordinator.broadcast('device:updated', {
+      deviceUid: primary.uid,
+      region: primary.region,
+      tenantId: primary.tenantId,
+    });
+    clusterCoordinator.broadcast('incident:updated', { region: primary.region });
+
     if (req.type === 'secret_in_log' && records[0]) {
       return {
         message: `Privacy test passed: stripped ${records[0].removedSecrets.length} secrets and dropped ${records[0].droppedFields.length} private fields before egress.`,
@@ -1163,6 +1551,382 @@ class NexauraEngine {
     };
   }
 
+  public getTenantCommPolicy(tenantId: string): TenantCommPolicy {
+    const existing = this.tenantCommPolicies.get(tenantId);
+    if (existing) return existing;
+    const sample = GLOBAL_TOPOLOGY.find((d) => d.tenantId === tenantId) ?? GLOBAL_TOPOLOGY[0];
+    const created = buildDefaultTenantCommPolicy(sample);
+    this.tenantCommPolicies.set(tenantId, created);
+    return created;
+  }
+
+  public listTenantCommPolicies(region?: RegionCode): TenantCommPolicy[] {
+    const all = Array.from(this.tenantCommPolicies.values());
+    return region ? all.filter((p) => p.region === region) : all;
+  }
+
+  public setTenantCommPolicy(params: {
+    tenantId: string;
+    allowOutsideDistrict?: boolean;
+    allowOutsideCity?: boolean;
+    allowOutsideCountry?: boolean;
+    actor: string;
+  }): TenantCommPolicy | null {
+    const sample = GLOBAL_TOPOLOGY.find((d) => d.tenantId === params.tenantId);
+    if (!sample) return null;
+    const current = this.getTenantCommPolicy(params.tenantId);
+    const updated: TenantCommPolicy = {
+      ...current,
+      allowOutsideDistrict: params.allowOutsideDistrict ?? current.allowOutsideDistrict,
+      allowOutsideCity: params.allowOutsideCity ?? current.allowOutsideCity,
+      allowOutsideCountry: params.allowOutsideCountry ?? current.allowOutsideCountry,
+      updatedBy: params.actor,
+      updatedAtUtc: new Date().toISOString(),
+    };
+    this.tenantCommPolicies.set(params.tenantId, updated);
+
+    const summary =
+      `Updated external comm locks for ${params.tenantId}: ` +
+      `Outside District=${updated.allowOutsideDistrict ? 'UNLOCKED' : 'LOCKED'}, ` +
+      `Outside City=${updated.allowOutsideCity ? 'UNLOCKED' : 'LOCKED'}, ` +
+      `Outside Country=${updated.allowOutsideCountry ? 'UNLOCKED' : 'LOCKED'}.`;
+
+    this.auditEvents.unshift({
+      timestampUtc: updated.updatedAtUtc!,
+      actor: params.actor,
+      action: 'TENANT_COMM_POLICY_UPDATED',
+      detail: summary,
+    });
+    this.recordStructuredLog({
+      category: 'tenant_data',
+      tier: 'both',
+      region: updated.region,
+      tenantId: updated.tenantId,
+      actor: params.actor,
+      action: 'TENANT_COMM_POLICY_UPDATED',
+      severity: 'medium',
+      summary,
+      details: {
+        allowOutsideDistrict: updated.allowOutsideDistrict,
+        allowOutsideCity: updated.allowOutsideCity,
+        allowOutsideCountry: updated.allowOutsideCountry,
+      },
+    });
+    this.recordStructuredLog({
+      category: 'user_activity',
+      tier: 'tier2',
+      region: updated.region,
+      tenantId: updated.tenantId,
+      actor: params.actor,
+      action: 'COMM_SCOPE_POLICY_CHANGE',
+      severity: 'low',
+      summary,
+    });
+    clusterCoordinator.broadcast('policy:updated', {
+      region: updated.region,
+      tenantId: updated.tenantId,
+    });
+    return updated;
+  }
+
+  public isPeerAllowedByPolicy(
+    fromDev: (typeof GLOBAL_TOPOLOGY)[number],
+    toDev: (typeof GLOBAL_TOPOLOGY)[number]
+  ): { allowed: boolean; boundary?: 'district' | 'city' | 'country'; reason?: string } {
+    const policy = this.getTenantCommPolicy(fromDev.tenantId);
+    return canNodesCommunicate(fromDev, toDev, policy);
+  }
+
+  public getVisiblePeersForDevice(dev: (typeof GLOBAL_TOPOLOGY)[number]) {
+    const policy = this.getTenantCommPolicy(dev.tenantId);
+    const visible: (typeof GLOBAL_TOPOLOGY)[number][] = [];
+    let lockedDistrict = 0;
+    let lockedCity = 0;
+    let lockedCountry = 0;
+
+    for (const candidate of GLOBAL_TOPOLOGY) {
+      if (candidate.uid === dev.uid) continue;
+      const check = canNodesCommunicate(dev, candidate, policy);
+      if (check.allowed) {
+        visible.push(candidate);
+      } else if (check.boundary === 'district') {
+        lockedDistrict++;
+      } else if (check.boundary === 'city') {
+        lockedCity++;
+      } else if (check.boundary === 'country') {
+        lockedCountry++;
+      }
+    }
+
+    return {
+      policy,
+      visiblePeers: visible,
+      lockedPeerCounts: {
+        outsideDistrict: lockedDistrict,
+        outsideCity: lockedCity,
+        outsideCountry: lockedCountry,
+        totalHidden: lockedDistrict + lockedCity + lockedCountry,
+      },
+    };
+  }
+
+  public recordFailedLoginAlert(params: {
+    username: string;
+    tier: 'tier1' | 'tier2';
+    region: RegionCode;
+    tenantId: string;
+    deviceUid?: string;
+    attemptCount: number;
+    locked: boolean;
+    reason: string;
+  }): void {
+    const matchedDev = params.deviceUid
+      ? GLOBAL_TOPOLOGY.find((d) => d.uid === params.deviceUid)
+      : GLOBAL_TOPOLOGY.find(
+          (d) =>
+            d.region === params.region &&
+            (params.tenantId === 'all' || d.tenantId === params.tenantId)
+        );
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const severity: Severity = params.locked ? 'critical' : params.attemptCount >= 2 ? 'high' : 'medium';
+
+    this.recordStructuredLog({
+      category: 'authentication',
+      tier: 'both',
+      region: params.region,
+      tenantId: params.tenantId,
+      deviceUid: matchedDev?.uid ?? params.deviceUid,
+      pseudoSourceId: matchedDev?.pseudoSourceId,
+      actor: params.username,
+      action: params.locked ? 'AUTH_LOCKOUT_3_ATTEMPTS' : 'AUTH_LOGIN_FAILED',
+      severity,
+      summary: params.reason,
+      details: {
+        attemptCount: params.attemptCount,
+        maxAttempts: 3,
+        locked: params.locked,
+        sourceTier: params.tier,
+      },
+    });
+
+    this.recordStructuredLog({
+      category: 'alerts',
+      tier: 'both',
+      region: params.region,
+      tenantId: params.tenantId,
+      deviceUid: matchedDev?.uid ?? params.deviceUid,
+      pseudoSourceId: matchedDev?.pseudoSourceId,
+      actor: 'auth-guard',
+      action: params.locked ? 'SERVER_SECURITY_LOCKOUT_ALERT' : 'SERVER_FAILED_LOGIN_ALERT',
+      severity: params.locked ? 'critical' : 'high',
+      summary: `Server Security Alert (${params.tier}): ${params.reason}`,
+      details: {
+        username: params.username,
+        attemptCount: params.attemptCount,
+        locked: params.locked,
+      },
+    });
+
+    this.auditEvents.unshift({
+      timestampUtc: nowIso,
+      actor: params.username,
+      action: params.locked ? 'FAILED_LOGIN_LOCKOUT_ALERT' : 'FAILED_LOGIN_ALERT',
+      detail: params.reason,
+    });
+
+    if (matchedDev) {
+      const m = this.deviceMetrics.get(matchedDev.uid);
+      if (m) {
+        m.failedLogins = Math.min(20, m.failedLogins + (params.locked ? 4 : 2));
+        const ev = evaluateHealth(m, nowMs, this.thresholds);
+        m.healthState = ev.state;
+        m.healthScore = ev.overallScore;
+      }
+      this.collectAndDispatch({
+        rawId: `auth-fail-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
+        deviceUid: matchedDev.uid,
+        tenantId: matchedDev.tenantId,
+        region: matchedDev.region,
+        eventTimeUtc: nowIso,
+        sourceTz: getCityTimezone(matchedDev.cityCode),
+        category: 'security',
+        metric: 'failed_logins_1m',
+        value: matchedDev ? (this.deviceMetrics.get(matchedDev.uid)?.failedLogins ?? params.attemptCount) : params.attemptCount,
+        severity: params.locked ? 'critical' : 'high',
+        rawMessage: `Sign-in failure alert on ${matchedDev.hostname} for account "${params.username}": ${params.reason}`,
+        injectedAtMs: nowMs,
+      });
+    }
+    this.persistWal();
+    clusterCoordinator.broadcast('logs:created', {
+      region: params.region,
+      tenantId: params.tenantId,
+      deviceUid: matchedDev?.uid ?? params.deviceUid,
+    });
+  }
+
+  public getNodeMetricHistory(pseudoSourceId: string): { cpu: number[]; latency: number[]; memory: number[] } {
+    return {
+      cpu: [...(this.metricHistories.get(`${pseudoSourceId}:cpu_pct`) ?? [])],
+      latency: [...(this.metricHistories.get(`${pseudoSourceId}:latency_ms`) ?? [])],
+      memory: [...(this.metricHistories.get(`${pseudoSourceId}:memory_pct`) ?? [])],
+    };
+  }
+
+  public injectManualTenantError(params: {
+    tenantId: string;
+    deviceUid?: string;
+    scenarioType: ScenarioType;
+    severity?: Severity;
+    customMessage?: string;
+    actor: string;
+  }): { message: string; records: EgressProofRecord[] } {
+    const dev =
+      (params.deviceUid && GLOBAL_TOPOLOGY.find((d) => d.uid === params.deviceUid)) ||
+      GLOBAL_TOPOLOGY.find((d) => d.tenantId === params.tenantId);
+
+    if (!dev) {
+      return { message: `Tenant "${params.tenantId}" not found.`, records: [] };
+    }
+
+    const res = this.triggerScenario({
+      type: params.scenarioType,
+      deviceUid: dev.uid,
+      region: dev.region,
+      tenantIds: [dev.tenantId],
+    });
+
+    if (params.customMessage && params.customMessage.trim()) {
+      this.recordStructuredLog({
+        category: 'alerts',
+        tier: 'both',
+        region: dev.region,
+        tenantId: dev.tenantId,
+        deviceUid: dev.uid,
+        pseudoSourceId: dev.pseudoSourceId,
+        actor: params.actor,
+        action: 'MANUAL_TENANT_FAULT_INJECTED',
+        severity: params.severity ?? 'high',
+        summary: `${dev.tenantId}: ${params.customMessage.trim()}`,
+      });
+    }
+
+    this.auditEvents.unshift({
+      timestampUtc: new Date().toISOString(),
+      actor: params.actor,
+      action: 'MANUAL_TENANT_ERROR',
+      detail: `Injected ${params.scenarioType} on ${dev.tenantId}${params.customMessage ? ` (${params.customMessage.trim()})` : ''}.`,
+    });
+
+    return {
+      message: `Injected manual fault (${params.scenarioType.replace(/_/g, ' ')}) on ${dev.tenantId}.`,
+      records: res.records,
+    };
+  }
+
+  public resolveManualTenantError(params: {
+    tenantId: string;
+    deviceUid?: string;
+    actor: string;
+  }): { resolvedNodes: number; closedIncidents: number; message: string } {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const targetDevices = GLOBAL_TOPOLOGY.filter(
+      (d) =>
+        d.tenantId === params.tenantId &&
+        (!params.deviceUid || d.uid === params.deviceUid)
+    );
+
+    if (targetDevices.length === 0) {
+      return { resolvedNodes: 0, closedIncidents: 0, message: `Tenant "${params.tenantId}" not found.` };
+    }
+
+    let resolvedNodes = 0;
+    for (const dev of targetDevices) {
+      const m = this.deviceMetrics.get(dev.uid);
+      if (!m) continue;
+      this.faultLatchedUids.delete(dev.uid);
+      m.online = true;
+      m.lastHeartbeatUtc = nowIso;
+      m.cpuPct = this.latestHostSample.cpuPct;
+      m.memoryPct = this.latestHostSample.memoryPct;
+      m.diskPct = this.latestHostSample.diskPct;
+      m.bandwidthMbps = Math.max(1.2, this.latestHostSample.deltaBandwidthMbps);
+      m.latencyMs = 4.5;
+      m.packetLossPct = 0.0;
+      m.failedLogins = 0;
+      if (m.router) m.router = resolveRouterFault(m.router);
+      if (m.storage) m.storage = resolveStorageFault(m.storage);
+      if (m.cloud) m.cloud = resolveCloudFault(m.cloud);
+      const ev = evaluateHealth(m, now, this.thresholds);
+      m.healthState = ev.state;
+      m.healthScore = ev.overallScore;
+      resolvedNodes++;
+    }
+
+    let closedIncidents = 0;
+    for (const inc of this.incidents) {
+      if (inc.tenantId === params.tenantId && inc.status !== 'remediated') {
+        inc.status = 'remediated';
+        inc.updatedAtUtc = nowIso;
+        closedIncidents++;
+        const rem = this.remediations.find((r) => r.incidentId === inc.incidentId);
+        if (rem && rem.stage !== 'executed_simulated') {
+          rem.approvedBy = rem.approvedBy ?? params.actor;
+          rem.stage = 'executed_simulated';
+          rem.auditLog.push({
+            timestampUtc: nowIso,
+            actor: params.actor,
+            event: `Manually resolved tenant faults for ${params.tenantId}.`,
+          });
+        }
+      }
+    }
+
+    const summary = `Cleared faults across ${resolvedNodes} node(s) and resolved ${closedIncidents} incident(s) for ${params.tenantId}.`;
+    const sampleDev = targetDevices[0];
+    this.auditEvents.unshift({
+      timestampUtc: nowIso,
+      actor: params.actor,
+      action: 'MANUAL_TENANT_FAULT_RESOLVED',
+      detail: summary,
+    });
+    this.recordStructuredLog({
+      category: 'alerts',
+      tier: 'both',
+      region: sampleDev.region,
+      tenantId: params.tenantId,
+      deviceUid: params.deviceUid,
+      pseudoSourceId: sampleDev.pseudoSourceId,
+      actor: params.actor,
+      action: 'TENANT_FAULT_RESOLVED',
+      severity: 'low',
+      summary,
+    });
+    this.recordStructuredLog({
+      category: 'user_activity',
+      tier: 'both',
+      region: sampleDev.region,
+      tenantId: params.tenantId,
+      deviceUid: params.deviceUid,
+      pseudoSourceId: sampleDev.pseudoSourceId,
+      actor: params.actor,
+      action: 'MANUAL_FAULT_RESOLUTION',
+      severity: 'low',
+      summary,
+    });
+    this.persistWal();
+    clusterCoordinator.broadcast('device:updated', {
+      deviceUid: params.deviceUid ?? sampleDev.uid,
+      region: sampleDev.region,
+      tenantId: params.tenantId,
+    });
+    clusterCoordinator.broadcast('incident:updated', { region: sampleDev.region, tenantId: params.tenantId });
+
+    return { resolvedNodes, closedIncidents, message: summary };
+  }
+
   public createFileTransfer(
     fromUid: string,
     toUid: string,
@@ -1172,12 +1936,13 @@ class NexauraEngine {
   ): EncryptedFileTransfer {
     const fromDev = GLOBAL_TOPOLOGY.find((d) => d.uid === fromUid) ?? GLOBAL_TOPOLOGY[0];
     const toDev = GLOBAL_TOPOLOGY.find((d) => d.uid === toUid) ?? GLOBAL_TOPOLOGY[1];
+    const boundaryCheck = this.isPeerAllowedByPolicy(fromDev, toDev);
     const crossTenant = fromDev.tenantId !== toDev.tenantId;
-    const allowed = !crossTenant || policyApproved;
+    const allowed = boundaryCheck.allowed && (!crossTenant || policyApproved);
 
     const cipherSeed = crypto.randomBytes(24).toString('base64');
     const transfer: EncryptedFileTransfer = {
-      transferId: `xfer-${Date.now().toString(36)}`,
+      transferId: `xfer-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`,
       fromUid: fromDev.uid,
       toUid: toDev.uid,
       fromTenantId: fromDev.tenantId,
@@ -1196,8 +1961,10 @@ class NexauraEngine {
     this.auditEvents.unshift({
       timestampUtc: transfer.createdAtUtc,
       actor: fromDev.uid,
-      action: allowed ? 'P2P_CIPHER_RELAY' : 'CROSS_TENANT_BLOCKED',
-      detail: `${fromDev.uid} -> ${toDev.uid} (${fileName}, ${sizeClass})`,
+      action: allowed ? 'P2P_CIPHER_RELAY' : 'CROSS_BOUNDARY_BLOCKED',
+      detail: boundaryCheck.allowed
+        ? `${fromDev.uid} -> ${toDev.uid} (${fileName}, ${sizeClass})`
+        : `${boundaryCheck.reason}`,
     });
     this.recordStructuredLog({
       category: 'transfer',
@@ -1209,9 +1976,355 @@ class NexauraEngine {
       actor: fromDev.hostname,
       action: allowed ? 'TRANSFER_SENT_RELAYED' : 'TRANSFER_BLOCKED_POLICY',
       severity: allowed ? 'low' : 'high',
-      summary: `${fileName} (${sizeClass}) ${shortPseudoId(fromDev.pseudoSourceId)} -> ${shortPseudoId(toDev.pseudoSourceId)} [${transfer.status}]`,
+      summary: boundaryCheck.allowed
+        ? `${fileName} (${sizeClass}) ${shortPseudoId(fromDev.pseudoSourceId)} -> ${shortPseudoId(toDev.pseudoSourceId)} [${transfer.status}]`
+        : `${fileName} blocked: ${boundaryCheck.reason}`,
+    });
+    if (!boundaryCheck.allowed) {
+      this.recordStructuredLog({
+        category: 'alerts',
+        tier: 'both',
+        region: fromDev.region,
+        tenantId: fromDev.tenantId,
+        deviceUid: fromDev.uid,
+        pseudoSourceId: fromDev.pseudoSourceId,
+        actor: 'mesh-policy-guard',
+        action: 'BOUNDARY_TRANSFER_DENIED',
+        severity: 'high',
+        summary: boundaryCheck.reason ?? 'External boundary transfer denied.',
+      });
+    }
+    const transferMb =
+      sizeClass === 'L (>1MB)'
+        ? 1.45
+        : sizeClass === 'M (100KB-1MB)'
+          ? 0.48
+          : sizeClass === 'S (10-100KB)'
+            ? 0.06
+            : 0.01;
+    const transferPackets = Math.max(8, Math.round(transferMb * 720));
+    const fromMetrics = this.deviceMetrics.get(fromDev.uid);
+    if (allowed && fromMetrics?.router) {
+      fromMetrics.router = advanceRouterTraffic(fromMetrics.router, transferMb, transferPackets);
+    }
+    const toMetrics = this.deviceMetrics.get(toDev.uid);
+    if (allowed && toMetrics?.router) {
+      toMetrics.router = advanceRouterTraffic(toMetrics.router, transferMb, transferPackets);
+    }
+    if (allowed && this.serverInfra[fromDev.region]?.router) {
+      this.serverInfra[fromDev.region].router = advanceRouterTraffic(
+        this.serverInfra[fromDev.region].router,
+        transferMb,
+        transferPackets
+      );
+    }
+
+    clusterCoordinator.broadcast('transfer:created', {
+      region: fromDev.region,
+      tenantId: fromDev.tenantId,
+      deviceUid: fromDev.uid,
     });
     return transfer;
+  }
+
+  public injectInfraFault(params: {
+    target: 'device' | 'server';
+    component: 'router' | 'storage' | 'cloud';
+    deviceUid?: string;
+    region?: RegionCode;
+    faultCode: string;
+    actor: string;
+  }): { ok: boolean; message: string; error?: string } {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    if (params.target === 'device') {
+      const dev = GLOBAL_TOPOLOGY.find((d) => d.uid === params.deviceUid);
+      if (!dev) return { ok: false, message: 'Device not found.', error: 'Device not found.' };
+      const m = this.deviceMetrics.get(dev.uid);
+      if (!m) return { ok: false, message: 'Device metrics unavailable.', error: 'Device metrics unavailable.' };
+      this.faultLatchedUids.add(dev.uid);
+
+      let detail = '';
+      let isCritical = false;
+      if (params.component === 'router' && m.router) {
+        m.router = applyRouterFault(m.router, params.faultCode as RouterFaultCode);
+        m.latencyMs = m.router.latencyMs;
+        m.packetLossPct = m.router.packetLossPct;
+        m.bandwidthMbps = m.router.bandwidthMbps;
+        detail = `${dev.hostname} Router (${m.router.routerId}): ${m.router.errorDetail}`;
+        isCritical = m.router.status === 'Critical' || m.router.status === 'Offline';
+      } else if (params.component === 'storage' && m.storage) {
+        m.storage = applyStorageFault(m.storage, params.faultCode as StorageFaultCode);
+        m.diskPct = m.storage.usedPct;
+        detail = `${dev.hostname} Storage (${m.storage.storageId}): ${m.storage.errorDetail}`;
+        isCritical = m.storage.status === 'Critical';
+      } else if (params.component === 'cloud' && m.cloud) {
+        m.cloud = applyCloudFault(m.cloud, params.faultCode as CloudFaultCode);
+        detail = `${dev.hostname} Cloud (${m.cloud.cloudId}): ${m.cloud.errorDetail}`;
+        isCritical = m.cloud.status === 'Critical';
+      }
+
+      const ev = evaluateHealth(m, now, this.thresholds);
+      m.healthState = ev.state;
+      m.healthScore = ev.overallScore;
+
+      this.auditEvents.unshift({
+        timestampUtc: nowIso,
+        actor: params.actor,
+        action: `DEVICE_${params.component.toUpperCase()}_FAULT`,
+        detail,
+      });
+      this.recordStructuredLog({
+        category: 'alerts',
+        tier: 'both',
+        region: dev.region,
+        tenantId: dev.tenantId,
+        deviceUid: dev.uid,
+        pseudoSourceId: dev.pseudoSourceId,
+        actor: params.actor,
+        action: `${params.component.toUpperCase()}_FAULT_INJECTED`,
+        severity: isCritical ? 'critical' : 'high',
+        summary: detail,
+      });
+      this.persistWal();
+      clusterCoordinator.broadcast('infra:updated', {
+        deviceUid: dev.uid,
+        region: dev.region,
+        tenantId: dev.tenantId,
+      });
+      return { ok: true, message: detail };
+    }
+
+    const region: RegionCode = params.region ?? 'IN';
+    const srv = this.serverInfra[region];
+    if (!srv) return { ok: false, message: 'Region not found.', error: 'Region not found.' };
+
+    let detail = '';
+    let isCritical = false;
+    if (params.component === 'router') {
+      srv.router = applyRouterFault(srv.router, params.faultCode as RouterFaultCode);
+      detail = `Server ${region} Core Router (${srv.router.routerId}): ${srv.router.errorDetail}`;
+      isCritical = srv.router.status === 'Critical' || srv.router.status === 'Offline';
+    } else if (params.component === 'storage') {
+      srv.storage = applyStorageFault(srv.storage, params.faultCode as StorageFaultCode);
+      detail = `Server ${region} Storage Array (${srv.storage.storageId}): ${srv.storage.errorDetail}`;
+      isCritical = srv.storage.status === 'Critical';
+    } else {
+      srv.cloud = applyCloudFault(srv.cloud, params.faultCode as CloudFaultCode);
+      detail = `Server ${region} Cloud Gateway (${srv.cloud.cloudId}): ${srv.cloud.errorDetail}`;
+      isCritical = srv.cloud.status === 'Critical';
+    }
+
+    this.auditEvents.unshift({
+      timestampUtc: nowIso,
+      actor: params.actor,
+      action: `SERVER_${params.component.toUpperCase()}_FAULT`,
+      detail,
+    });
+    this.recordStructuredLog({
+      category: 'alerts',
+      tier: 'tier2',
+      region,
+      tenantId: 'all',
+      actor: params.actor,
+      action: `SERVER_${params.component.toUpperCase()}_FAULT`,
+      severity: isCritical ? 'critical' : 'high',
+      summary: detail,
+    });
+    this.persistWal();
+    clusterCoordinator.broadcast('infra:updated', { region });
+    return { ok: true, message: detail };
+  }
+
+  public resolveInfraFault(params: {
+    target: 'device' | 'server';
+    component: 'router' | 'storage' | 'cloud' | 'all';
+    deviceUid?: string;
+    region?: RegionCode;
+    actor: string;
+  }): { ok: boolean; message: string; error?: string } {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    if (params.target === 'device') {
+      const dev = GLOBAL_TOPOLOGY.find((d) => d.uid === params.deviceUid);
+      if (!dev) return { ok: false, message: 'Device not found.', error: 'Device not found.' };
+      const m = this.deviceMetrics.get(dev.uid);
+      if (!m) return { ok: false, message: 'Device metrics unavailable.', error: 'Device metrics unavailable.' };
+      this.faultLatchedUids.delete(dev.uid);
+
+      if ((params.component === 'router' || params.component === 'all') && m.router) {
+        m.router = resolveRouterFault(m.router);
+        m.latencyMs = m.router.latencyMs;
+        m.packetLossPct = m.router.packetLossPct;
+        m.bandwidthMbps = m.router.bandwidthMbps;
+      }
+      if ((params.component === 'storage' || params.component === 'all') && m.storage) {
+        m.storage = resolveStorageFault(m.storage);
+        m.diskPct = m.storage.usedPct;
+      }
+      if ((params.component === 'cloud' || params.component === 'all') && m.cloud) {
+        m.cloud = resolveCloudFault(m.cloud);
+      }
+
+      const ev = evaluateHealth(m, now, this.thresholds);
+      m.healthState = ev.state;
+      m.healthScore = ev.overallScore;
+
+      const msg = `Cleared ${params.component} fault on ${dev.hostname}; link and storage nominal.`;
+      this.auditEvents.unshift({
+        timestampUtc: nowIso,
+        actor: params.actor,
+        action: 'DEVICE_INFRA_RESOLVED',
+        detail: msg,
+      });
+      this.recordStructuredLog({
+        category: 'user_activity',
+        tier: 'both',
+        region: dev.region,
+        tenantId: dev.tenantId,
+        deviceUid: dev.uid,
+        pseudoSourceId: dev.pseudoSourceId,
+        actor: params.actor,
+        action: 'DEVICE_INFRA_RESOLVED',
+        severity: 'low',
+        summary: msg,
+      });
+      this.persistWal();
+      clusterCoordinator.broadcast('infra:updated', {
+        deviceUid: dev.uid,
+        region: dev.region,
+        tenantId: dev.tenantId,
+      });
+      return { ok: true, message: msg };
+    }
+
+    const region: RegionCode = params.region ?? 'IN';
+    const srv = this.serverInfra[region];
+    if (!srv) return { ok: false, message: 'Region not found.', error: 'Region not found.' };
+
+    if (params.component === 'router' || params.component === 'all') {
+      srv.router = resolveRouterFault(srv.router);
+    }
+    if (params.component === 'storage' || params.component === 'all') {
+      srv.storage = resolveStorageFault(srv.storage);
+    }
+    if (params.component === 'cloud' || params.component === 'all') {
+      srv.cloud = resolveCloudFault(srv.cloud);
+    }
+
+    const msg = `Restored ${region} regional server ${params.component} subsystem to Nominal status.`;
+    this.auditEvents.unshift({
+      timestampUtc: nowIso,
+      actor: params.actor,
+      action: 'SERVER_INFRA_RESOLVED',
+      detail: msg,
+    });
+    this.recordStructuredLog({
+      category: 'user_activity',
+      tier: 'tier2',
+      region,
+      tenantId: 'all',
+      actor: params.actor,
+      action: 'SERVER_INFRA_RESOLVED',
+      severity: 'low',
+      summary: msg,
+    });
+    this.persistWal();
+    clusterCoordinator.broadcast('infra:updated', { region });
+    return { ok: true, message: msg };
+  }
+
+  public requestAdminPermission(params: {
+    adminUsername: string;
+    permission: AdminPermissionKey;
+    reason: string;
+  }): { ok: boolean; record?: CountryAdminRecord; error?: string } {
+    const rec = this.countryAdmins.find(
+      (a) => a.adminUsername.toLowerCase() === params.adminUsername.toLowerCase()
+    );
+    if (!rec) return { ok: false, error: 'Country Admin profile not found.' };
+
+    const existingPending = rec.pendingRequests.find(
+      (r) => r.permission === params.permission && r.status === 'pending'
+    );
+    if (existingPending) {
+      return { ok: true, record: rec };
+    }
+
+    const nowIso = new Date().toISOString();
+    rec.pendingRequests.unshift({
+      requestId: `perm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      permission: params.permission,
+      reason: params.reason.trim() || `Requesting ${params.permission} for ${rec.countryName}`,
+      requestedAtUtc: nowIso,
+      status: 'pending',
+    });
+    rec.pendingRequests = rec.pendingRequests.slice(0, 20);
+
+    const detail = `${rec.adminUsername} (${rec.countryName}) requested "${params.permission}" permission from Super Admin (${rec.countrySuperAdminId}).`;
+    this.auditEvents.unshift({
+      timestampUtc: nowIso,
+      actor: rec.adminUsername,
+      action: 'ADMIN_PERMISSION_REQUESTED',
+      detail,
+    });
+    this.recordStructuredLog({
+      category: 'user_activity',
+      tier: 'tier2',
+      region: rec.region,
+      tenantId: 'all',
+      actor: rec.adminUsername,
+      action: 'ADMIN_PERMISSION_REQUESTED',
+      severity: 'medium',
+      summary: detail,
+    });
+    clusterCoordinator.broadcast('policy:updated', { region: rec.region });
+    return { ok: true, record: rec };
+  }
+
+  public decideAdminPermission(params: {
+    adminUsername: string;
+    permission: AdminPermissionKey;
+    grant: boolean;
+    decidedBy: string;
+  }): { ok: boolean; record?: CountryAdminRecord; error?: string } {
+    const rec = this.countryAdmins.find(
+      (a) => a.adminUsername.toLowerCase() === params.adminUsername.toLowerCase()
+    );
+    if (!rec) return { ok: false, error: 'Country Admin profile not found.' };
+
+    const nowIso = new Date().toISOString();
+    rec.permissions[params.permission] = params.grant;
+
+    for (const req of rec.pendingRequests) {
+      if (req.permission === params.permission && req.status === 'pending') {
+        req.status = params.grant ? 'approved' : 'rejected';
+        req.decidedBy = params.decidedBy;
+        req.decidedAtUtc = nowIso;
+      }
+    }
+
+    const detail = `Super Admin "${params.decidedBy}" ${params.grant ? 'GRANTED' : 'REVOKED'} "${params.permission}" for ${rec.adminUsername} (${rec.countryName}).`;
+    this.auditEvents.unshift({
+      timestampUtc: nowIso,
+      actor: params.decidedBy,
+      action: params.grant ? 'ADMIN_PERMISSION_GRANTED' : 'ADMIN_PERMISSION_REVOKED',
+      detail,
+    });
+    this.recordStructuredLog({
+      category: 'authentication',
+      tier: 'tier2',
+      region: rec.region,
+      tenantId: 'all',
+      actor: params.decidedBy,
+      action: params.grant ? 'ADMIN_PERMISSION_GRANTED' : 'ADMIN_PERMISSION_REVOKED',
+      severity: params.grant ? 'medium' : 'low',
+      summary: detail,
+    });
+    clusterCoordinator.broadcast('policy:updated', { region: rec.region });
+    return { ok: true, record: rec };
   }
 
   public getReconcileSummary() {
@@ -1282,18 +2395,31 @@ class NexauraEngine {
         m.latencyMs = Math.min(m.latencyMs, 24);
         m.packetLossPct = 0.05;
         m.bandwidthMbps = Math.min(m.bandwidthMbps, 220);
+        if (m.router) m.router = resolveRouterFault(m.router);
       }
       if (params.intent === 'security' || params.intent === 'all') {
         m.failedLogins = 0;
       }
       if (params.intent === 'disk' || params.intent === 'all') {
         m.diskPct = Math.min(m.diskPct, 54);
+        if (m.storage) m.storage = resolveStorageFault(m.storage);
+      }
+      if (params.intent === 'all' && m.cloud) {
+        m.cloud = resolveCloudFault(m.cloud);
       }
 
       const afterEv = evaluateHealth(m, now, this.thresholds);
       m.healthState = afterEv.state;
       m.healthScore = afterEv.overallScore;
       affectedNodes.push(shortPseudoId(dev.pseudoSourceId));
+    }
+    if (params.intent === 'all') {
+      const srv = this.serverInfra[params.region];
+      if (srv) {
+        srv.router = resolveRouterFault(srv.router);
+        srv.storage = resolveStorageFault(srv.storage);
+        srv.cloud = resolveCloudFault(srv.cloud);
+      }
     }
 
     // Mark matching open incidents in this region as remediated when resolved cleanly
@@ -1342,6 +2468,9 @@ class NexauraEngine {
       summary: detail,
     });
 
+    clusterCoordinator.broadcast('incident:updated', { region: params.region });
+    clusterCoordinator.broadcast('device:updated', { region: params.region });
+
     return {
       resolvedCount: affectedNodes.length + closedIncidents,
       summary: detail,
@@ -1381,13 +2510,14 @@ class NexauraEngine {
       if (inc) inc.status = 'remediated';
       for (const dev of GLOBAL_TOPOLOGY) {
         if (dev.tenantId === res.updated.tenantId) {
+          this.faultLatchedUids.delete(dev.uid);
           const m = this.deviceMetrics.get(dev.uid);
           if (m) {
-            m.cpuPct = Math.min(m.cpuPct, 38);
-            m.memoryPct = Math.min(m.memoryPct, 48);
-            m.latencyMs = Math.min(m.latencyMs, 26);
-            m.packetLossPct = 0.05;
-            m.diskPct = Math.min(m.diskPct, 55);
+            m.cpuPct = Math.min(m.cpuPct, this.latestHostSample.cpuPct);
+            m.memoryPct = Math.min(m.memoryPct, this.latestHostSample.memoryPct);
+            m.latencyMs = Math.min(m.latencyMs, 18);
+            m.packetLossPct = 0.0;
+            m.diskPct = this.latestHostSample.diskPct;
             m.failedLogins = 0;
             m.online = true;
             m.lastHeartbeatUtc = new Date().toISOString();
@@ -1395,6 +2525,10 @@ class NexauraEngine {
         }
       }
     }
+    clusterCoordinator.broadcast('incident:updated', {
+      region: res.updated.region,
+      tenantId: res.updated.tenantId,
+    });
     return { record: res.updated };
   }
 }

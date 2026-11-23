@@ -74,7 +74,7 @@ export function SuperAdminLogin() {
                 Nexaura Regional Control Plane
               </p>
               <h1 className="mt-1 font-display text-2xl font-semibold text-white">
-                Tier 2 Super Admin Sign In
+                Tier 2 Admin & Super Admin Sign In
               </h1>
             </div>
             <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-[#2B3242] bg-[#0B0D11] text-blue-400">
@@ -83,7 +83,7 @@ export function SuperAdminLogin() {
           </div>
 
           <p className="mt-4 text-xs leading-relaxed text-zinc-400">
-            Fresh authentication required. Regional SaaS views sanitized metadata only, enforcing strict data residency and zero access to raw device logs.
+            Fresh authentication required. Super Admins oversee multi-country operations and grant privileges, while Country Admins manage assigned devices inside their own country.
           </p>
 
           <form onSubmit={handleSubmit} className="mt-5 space-y-4">
@@ -112,7 +112,7 @@ export function SuperAdminLogin() {
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="super.admin"
+                placeholder="super.admin or admin.in"
                 className="mt-1.5 w-full rounded-md border border-[#2B3242] bg-[#0B0D11] px-3.5 py-2.5 text-sm text-white placeholder:text-zinc-500 focus:border-blue-500 focus:outline-none"
               />
             </div>
@@ -150,20 +150,20 @@ export function SuperAdminLogin() {
             </button>
           </form>
 
-          <div className="mt-5 space-y-2 rounded-lg border border-[#222733] bg-[#0B0D11] p-3.5 text-xs">
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-medium text-zinc-300">Demo Logins</span>
-              <div className="flex gap-1.5">
+          <div className="mt-5 space-y-2.5 rounded-lg border border-[#222733] bg-[#0B0D11] p-3.5 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-medium text-zinc-300">Quick-Fill Accounts</span>
+              <div className="flex flex-wrap gap-1.5">
                 <button
                   type="button"
                   onClick={() => {
                     setUsername('super.admin');
                     setPassword('NexauraSuper!24');
                   }}
-                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
                 >
                   <KeyRound className="h-3 w-3" />
-                  Fill Super Admin
+                  Super Admin
                 </button>
                 <button
                   type="button"
@@ -171,16 +171,61 @@ export function SuperAdminLogin() {
                     setUsername('secops.peer');
                     setPassword('NexauraPeer!24');
                   }}
-                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
                 >
-                  Fill Peer SecOps
+                  Peer SecOps
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsername('admin.in');
+                    setPassword('NexauraAdminIN!24');
+                    setRegion('IN');
+                  }}
+                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                >
+                  Admin (IN)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsername('admin.de');
+                    setPassword('NexauraAdminDE!24');
+                    setRegion('EU');
+                  }}
+                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                >
+                  Admin (DE)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsername('admin.gb');
+                    setPassword('NexauraAdminGB!24');
+                    setRegion('EU');
+                  }}
+                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                >
+                  Admin (UK)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUsername('admin.us');
+                    setPassword('NexauraAdminUS!24');
+                    setRegion('US');
+                  }}
+                  className="inline-flex items-center gap-1 rounded border border-[#2B3242] bg-[#1A1E28] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
+                >
+                  Admin (US)
                 </button>
               </div>
             </div>
-            <div className="font-mono text-[11px] text-zinc-400">
-              <div>super.admin / NexauraSuper!24 (Full Region Read)</div>
-              <div>secops.peer / NexauraPeer!24 (Peer Approver)</div>
-              <div>tenant.admin / NexauraTenant!24 (Tenant & Region Locked)</div>
+            <div className="space-y-0.5 font-mono text-[11px] text-zinc-400">
+              <div>super.admin / NexauraSuper!24 · secops.peer / NexauraPeer!24 (Super Admin)</div>
+              <div>admin.in / NexauraAdminIN!24 (India Admin · Requests Super Admin grants)</div>
+              <div>admin.de / NexauraAdminDE!24 · admin.gb / NexauraAdminGB!24 (EU Country Admins)</div>
+              <div>admin.us / NexauraAdminUS!24 · tenant.admin / NexauraTenant!24</div>
             </div>
           </div>
         </div>
